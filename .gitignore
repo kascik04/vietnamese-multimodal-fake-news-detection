@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoints & Logs
+checkpoints/
+logs/
+*.pt
+*.pth
+*.bin
+
+# Datasets
+data/
+*.csv
+*.tsv
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE / System
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

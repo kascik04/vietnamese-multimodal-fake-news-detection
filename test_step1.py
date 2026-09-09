@@ -147,6 +147,10 @@ def test_dataset_and_dataloader() -> None:
         val_csv="data/val.csv",
         image_dir="data/images",
         num_workers=0,  # Safe for local test
+        social_feature_cols=[
+            "share_count", "like_count", "comment_count",
+            "love_ratio", "haha_ratio", "angry_ratio", "sad_ratio",
+        ],
     )
 
     print("Loading PhoBERT tokenizer & creating dataloaders...")

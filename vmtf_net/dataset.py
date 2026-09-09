@@ -411,6 +411,7 @@ def create_dataloaders(
 
     # 5. Create Test DataLoader
     test_loader = None
+    test_dataset = None
     if test_data is not None:
         test_dataset = VMTFDataset(
             data=test_data,

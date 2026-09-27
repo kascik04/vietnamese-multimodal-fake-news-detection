@@ -33,6 +33,24 @@ def _detect_default_num_workers() -> int:
     return min(4, os.cpu_count() or 1)
 
 
+BASIC_SOCIAL_COLS: List[str] = [
+    "share_count",
+    "like_count",
+    "comment_count",
+]
+
+EXTENDED_SOCIAL_COLS: List[str] = [
+    "like_count",
+    "comment_count",
+    "share_count",
+    "angry_count",
+    "haha_count",
+    "like_share_ratio",
+    "comment_share_ratio",
+    "engagement_ratio",
+]
+
+
 @dataclass
 class VMTFConfig:
     """
@@ -73,6 +91,9 @@ class VMTFConfig:
     # ==========================================
     # 3. SOCIAL METRICS ENCODER (MLP)
     # ==========================================
+    social_preset: str = "basic"
+    """Social features preset: 'basic' (3 features) or 'extended' (8 features from dataset schema)"""
+
     social_feature_cols: List[str] = field(
         default_factory=lambda: [
             "share_count",
@@ -80,10 +101,10 @@ class VMTFConfig:
             "comment_count",
         ]
     )
-    """List of numerical engagement columns: [share_count, like_count, comment_count] across Facebook/Threads/X"""
+    """List of numerical engagement columns: [share_count, like_count, comment_count] or extended set"""
     
     social_input_dim: int = 3
-    """Number of numerical input features (default 3: share_count, like_count, comment_count)"""
+    """Number of numerical input features (default 3: share_count, like_count, comment_count; or 8 for extended)"""
 
     
     social_hidden_dim: int = 128
@@ -209,6 +230,8 @@ class VMTFConfig:
 
     def __post_init__(self) -> None:
         """Validate and adjust parameters post-initialization."""
+        if self.social_preset == "extended" and self.social_feature_cols == BASIC_SOCIAL_COLS:
+            self.social_feature_cols = list(EXTENDED_SOCIAL_COLS)
         self.social_input_dim = len(self.social_feature_cols)
         
         # If running on CPU, disable AMP and pin_memory automatically

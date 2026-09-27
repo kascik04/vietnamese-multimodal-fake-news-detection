@@ -44,7 +44,8 @@ class SocialFeatureNormalizer:
 
     def fit(self, df: pd.DataFrame) -> "SocialFeatureNormalizer":
         """Fit StandardScaler on log1p-transformed social features."""
-        raw_vals = df[self.feature_cols].copy().fillna(0.0).values.astype(np.float32)
+        numeric_df = df[self.feature_cols].copy().apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        raw_vals = numeric_df.values.astype(np.float32)
         # Apply log1p on non-negative values to compress scale of viral outlier counts
         log_vals = np.log1p(np.clip(raw_vals, a_min=0.0, a_max=None))
         self.scaler = StandardScaler()
@@ -53,7 +54,8 @@ class SocialFeatureNormalizer:
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         """Transform social features using fitted scaler."""
-        raw_vals = df[self.feature_cols].copy().fillna(0.0).values.astype(np.float32)
+        numeric_df = df[self.feature_cols].copy().apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        raw_vals = numeric_df.values.astype(np.float32)
         log_vals = np.log1p(np.clip(raw_vals, a_min=0.0, a_max=None))
         if self.scaler is not None:
             norm_vals = self.scaler.transform(log_vals)
@@ -108,17 +110,28 @@ class VMTFDataset(Dataset):
         else:
             raise TypeError("Data must be either a file path string or pandas DataFrame.")
 
-        # Ensure ID column exists (supports 'post_id', 'id', 'sample_id')
-        self.id_col = self._resolve_column_name(["post_id", "id", "sample_id"], required=False)
+        # Ensure ID column exists (supports 'sample_id', 'post_id', 'id', 'claim_id')
+        self.id_col = self._resolve_column_name(["sample_id", "post_id", "id", "claim_id"], required=False)
         if self.id_col is None:
             self.df["post_id"] = [f"sample_{i}" for i in range(len(self.df))]
             self.id_col = "post_id"
 
+        # Filter out template/mock example rows (e.g. EXAMPLE_000001)
+        if self.id_col in self.df.columns:
+            example_mask = self.df[self.id_col].astype(str).str.startswith("EXAMPLE_")
+            if example_mask.any():
+                logger.info(f"Filtered out {example_mask.sum()} template/example rows (ID starts with 'EXAMPLE_').")
+                self.df = self.df[~example_mask].reset_index(drop=True)
+
         # Ensure Text column exists (supports 'text', 'content', 'post_text', 'title')
         self.text_col = self._resolve_column_name(["text", "content", "post_text", "title"])
         
-        # Ensure Image Path column exists (supports 'image_path', 'image', 'img_path', 'image_name')
-        self.image_col = self._resolve_column_name(["image_path", "image", "img_path", "image_name"], required=False)
+        # Ensure Image Path column exists (supports 'image_1_local_path', 'image_path', 'image', 'img_path', 'image_name')
+        self.image_col = self._resolve_column_name(
+            ["image_1_local_path", "image_path", "image", "img_path", "image_name"], required=False
+        )
+        # Track alternate multi-image columns for robust fallback
+        self.alt_image_cols = [c for c in ["image_2_local_path", "image_3_local_path"] if c in self.df.columns]
 
         # Ensure Label column exists if present (supports 'label', 'fake_label', 'is_fake', 'target')
         self.label_col = self._resolve_column_name(["label", "fake_label", "is_fake", "target"], required=False)
@@ -168,14 +181,38 @@ class VMTFDataset(Dataset):
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
 
-        # 4. Social Features Normalization
-        # Check available social feature columns in DataFrame
-        valid_social_cols = [c for c in self.config.social_feature_cols if c in self.df.columns]
-        if len(valid_social_cols) < len(self.config.social_feature_cols):
-            missing_cols = set(self.config.social_feature_cols) - set(valid_social_cols)
-            logger.info(f"Creating missing social feature columns with 0.0: {missing_cols}")
-            for col in missing_cols:
+        # 4. Social Features Normalization & Auto-completion
+        # Ensure base count columns exist and are numeric before computing ratios
+        for base_col in ["like_count", "comment_count", "share_count", "angry_count", "haha_count"]:
+            if base_col in self.df.columns:
+                self.df[base_col] = pd.to_numeric(self.df[base_col], errors="coerce").fillna(0.0)
+
+        # Auto-compute derived ratios if missing in dataframe
+        if "like_share_ratio" in self.config.social_feature_cols:
+            if "like_share_ratio" not in self.df.columns or self.df["like_share_ratio"].isna().all():
+                likes = self.df["like_count"].values if "like_count" in self.df.columns else np.zeros(len(self.df))
+                shares = self.df["share_count"].values if "share_count" in self.df.columns else np.zeros(len(self.df))
+                self.df["like_share_ratio"] = likes / (shares + 1.0)
+
+        if "comment_share_ratio" in self.config.social_feature_cols:
+            if "comment_share_ratio" not in self.df.columns or self.df["comment_share_ratio"].isna().all():
+                comments = self.df["comment_count"].values if "comment_count" in self.df.columns else np.zeros(len(self.df))
+                shares = self.df["share_count"].values if "share_count" in self.df.columns else np.zeros(len(self.df))
+                self.df["comment_share_ratio"] = comments / (shares + 1.0)
+
+        if "engagement_ratio" in self.config.social_feature_cols:
+            if "engagement_ratio" not in self.df.columns or self.df["engagement_ratio"].isna().all():
+                likes = self.df["like_count"].values if "like_count" in self.df.columns else np.zeros(len(self.df))
+                comments = self.df["comment_count"].values if "comment_count" in self.df.columns else np.zeros(len(self.df))
+                shares = self.df["share_count"].values if "share_count" in self.df.columns else np.zeros(len(self.df))
+                self.df["engagement_ratio"] = (likes + comments + shares * 2.0) / (likes + 1.0)
+
+        # Ensure all required social columns exist and are numeric
+        for col in self.config.social_feature_cols:
+            if col not in self.df.columns:
                 self.df[col] = 0.0
+            else:
+                self.df[col] = pd.to_numeric(self.df[col], errors="coerce").fillna(0.0)
 
         if social_normalizer is not None:
             self.social_normalizer = social_normalizer
@@ -198,29 +235,84 @@ class VMTFDataset(Dataset):
         """Return total number of samples in the dataset."""
         return len(self.df)
 
-    def _load_image(self, img_path: Optional[str]) -> Image.Image:
+    def _find_image_path(self, row: pd.Series) -> Optional[str]:
+        """
+        Identify the first valid image path from primary and fallback columns.
+        Supports checking full path, relative path in config.image_dir, and filename.
+        """
+        candidate_cols = []
+        if self.image_col:
+            candidate_cols.append(self.image_col)
+        candidate_cols.extend([c for c in getattr(self, "alt_image_cols", []) if c != self.image_col])
+
+        for col in candidate_cols:
+            val = row.get(col, None)
+            if val is not None and not pd.isna(val) and str(val).strip() != "":
+                c_path = str(val).strip()
+                # 1. Direct path exists
+                if os.path.exists(c_path):
+                    return c_path
+                # 2. Relative to config.image_dir
+                joined = os.path.join(self.config.image_dir, c_path)
+                if os.path.exists(joined):
+                    return joined
+                # 3. Basename inside config.image_dir
+                base_joined = os.path.join(self.config.image_dir, os.path.basename(c_path))
+                if os.path.exists(base_joined):
+                    return base_joined
+
+        # If no physical file found, return primary candidate string for logging
+        if self.image_col:
+            val = row.get(self.image_col, None)
+            if val is not None and not pd.isna(val) and str(val).strip() != "":
+                return str(val).strip()
+        return None
+
+    def _load_image(self, candidate_path: Optional[str]) -> Image.Image:
         """
         Safely load image from relative or absolute file path.
         If file is missing or corrupted, returns a neutral placeholder image.
         """
-        if not img_path or pd.isna(img_path) or str(img_path).strip() == "":
+        if not candidate_path or pd.isna(candidate_path) or str(candidate_path).strip() == "":
             return Image.new("RGB", (self.config.image_size, self.config.image_size), color=(128, 128, 128))
 
-        # Check full path or relative to config.image_dir
-        candidate_path = str(img_path).strip()
-        if not os.path.isabs(candidate_path) and not os.path.exists(candidate_path):
-            candidate_path = os.path.join(self.config.image_dir, candidate_path)
+        p = str(candidate_path).strip()
+        # Resolve full path or relative to config.image_dir
+        if not os.path.isabs(p) and not os.path.exists(p):
+            p = os.path.join(self.config.image_dir, p)
 
-        if not os.path.exists(candidate_path):
-            # Fallback placeholder image
-            return Image.new("RGB", (self.config.image_size, self.config.image_size), color=(128, 128, 128))
+        if not os.path.exists(p):
+            # Try basename inside config.image_dir
+            base_p = os.path.join(self.config.image_dir, os.path.basename(p))
+            if os.path.exists(base_p):
+                p = base_p
+            else:
+                return Image.new("RGB", (self.config.image_size, self.config.image_size), color=(128, 128, 128))
 
         try:
-            with Image.open(candidate_path) as img:
+            with Image.open(p) as img:
                 return img.convert("RGB")
         except Exception as e:
-            logger.warning(f"Error loading image {candidate_path}: {e}. Using neutral placeholder.")
+            logger.warning(f"Error loading image {p}: {e}. Using neutral placeholder.")
             return Image.new("RGB", (self.config.image_size, self.config.image_size), color=(128, 128, 128))
+
+    @staticmethod
+    def _parse_label(val: Any) -> Optional[int]:
+        """Safely parse label to binary integer: 0 (real) or 1 (fake)."""
+        if pd.isna(val) or val is None or str(val).strip() == "":
+            return None
+        val_str = str(val).strip().lower()
+        if val_str in ["1", "1.0", "fake", "true_fake", "tin_gia"]:
+            return 1
+        if val_str in ["0", "0.0", "real", "legit", "tin_that"]:
+            return 0
+        try:
+            f_val = float(val)
+            if not np.isnan(f_val):
+                return int(f_val)
+        except (ValueError, TypeError):
+            pass
+        return None
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
@@ -257,8 +349,8 @@ class VMTFDataset(Dataset):
         # ------------------------------------------------------------------
         # 2. Visual Modality Processing
         # ------------------------------------------------------------------
-        img_val = row[self.image_col] if self.image_col else None
-        image = self._load_image(img_val)
+        img_path = self._find_image_path(row)
+        image = self._load_image(img_path)
 
         if self.image_processor is not None and not self.is_train:
             # Use HuggingFace processor if available
@@ -285,8 +377,10 @@ class VMTFDataset(Dataset):
         }
 
         # Include label if available in dataset
-        if self.label_col and not pd.isna(row[self.label_col]):
-            item["label"] = torch.tensor(int(row[self.label_col]), dtype=torch.long)
+        if self.label_col and self.label_col in self.df.columns:
+            parsed_lbl = self._parse_label(row[self.label_col])
+            if parsed_lbl is not None:
+                item["label"] = torch.tensor(parsed_lbl, dtype=torch.long)
 
         return item
 
@@ -390,6 +484,7 @@ def create_dataloaders(
 
     # 4. Create Validation DataLoader
     val_loader = None
+    val_dataset = None
     if val_data is not None:
         val_dataset = VMTFDataset(
             data=val_data,

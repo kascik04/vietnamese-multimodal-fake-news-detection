@@ -38,58 +38,50 @@ def generate_mock_data(data_dir: str = "data") -> None:
         draw.text((10, 10), name, fill=(255, 255, 255))
         img.save(img_path)
 
-    # 2. Create sample Vietnamese multimodal records
+    # 2. Create sample Vietnamese multimodal records using standard schema columns
     mock_records = [
         {
-            "id": "post_001",
+            "sample_id": "post_001",
             "text": "Bộ Y Tế chính thức bác bỏ tin đồn thất thiệt lan truyền trên mạng xã hội sáng nay.",
-            "image_path": "news_1.jpg",
+            "image_1_local_path": "news_1.jpg",
             "like_count": 1250,
             "comment_count": 340,
             "share_count": 120,
-            "love_ratio": 0.65,
-            "haha_ratio": 0.05,
-            "angry_ratio": 0.02,
-            "sad_ratio": 0.01,
+            "angry_count": 15,
+            "haha_count": 30,
             "label": 0,  # Real News
         },
         {
-            "id": "post_002",
+            "sample_id": "post_002",
             "text": "Cảnh báo khẩn cấp: Phương pháp chữa bách bệnh bằng lá cây chưa qua kiểm chứng khoa học!",
-            "image_path": "news_2.jpg",
+            "image_1_local_path": "news_2.jpg",
             "like_count": 89000,
             "comment_count": 15400,
             "share_count": 45000,
-            "love_ratio": 0.10,
-            "haha_ratio": 0.40,
-            "angry_ratio": 0.35,
-            "sad_ratio": 0.15,
+            "angry_count": 31150,
+            "haha_count": 35600,
             "label": 1,  # Fake News
         },
         {
-            "id": "post_003",
+            "sample_id": "post_003",
             "text": "Chính phủ phê duyệt dự án phát triển công nghệ cao và trí tuệ nhân tạo quốc gia.",
-            "image_path": "news_3.jpg",
+            "image_1_local_path": "news_3.jpg",
             "like_count": 4500,
             "comment_count": 820,
             "share_count": 910,
-            "love_ratio": 0.80,
-            "haha_ratio": 0.02,
-            "angry_ratio": 0.01,
-            "sad_ratio": 0.00,
+            "angry_count": 10,
+            "haha_count": 45,
             "label": 0,  # Real News
         },
         {
-            "id": "post_004",
+            "sample_id": "post_004",
             "text": "Sốc: Hình ảnh sinh vật lạ xuất hiện tại vùng biển miền Trung gây hoang mang dư luận.",
-            "image_path": "news_4.jpg",
+            "image_1_local_path": "news_4.jpg",
             "like_count": 52000,
             "comment_count": 8700,
             "share_count": 19500,
-            "love_ratio": 0.05,
-            "haha_ratio": 0.55,
-            "angry_ratio": 0.25,
-            "sad_ratio": 0.15,
+            "angry_count": 13000,
+            "haha_count": 28600,
             "label": 1,  # Fake News
         },
     ]
@@ -147,10 +139,7 @@ def test_dataset_and_dataloader() -> None:
         val_csv="data/val.csv",
         image_dir="data/images",
         num_workers=0,  # Safe for local test
-        social_feature_cols=[
-            "share_count", "like_count", "comment_count",
-            "love_ratio", "haha_ratio", "angry_ratio", "sad_ratio",
-        ],
+        social_preset="extended",
     )
 
     print("Loading PhoBERT tokenizer & creating dataloaders...")
@@ -165,13 +154,13 @@ def test_dataset_and_dataloader() -> None:
     print(f"    - input_ids shape:       {list(batch['input_ids'].shape)}  (Expected: [2, 64])")
     print(f"    - attention_mask shape:  {list(batch['attention_mask'].shape)}  (Expected: [2, 64])")
     print(f"    - pixel_values shape:    {list(batch['pixel_values'].shape)}  (Expected: [2, 3, 224, 224])")
-    print(f"    - social_features shape: {list(batch['social_features'].shape)}  (Expected: [2, 7])")
+    print(f"    - social_features shape: {list(batch['social_features'].shape)}  (Expected: [2, 8])")
     print(f"    - label shape:           {list(batch['label'].shape)}  (Expected: [2])")
     print(f"    - labels:                {batch['label'].tolist()}")
 
     assert batch["input_ids"].shape == (2, 64), "Text input_ids shape mismatch!"
     assert batch["pixel_values"].shape == (2, 3, 224, 224), "Pixel values shape mismatch!"
-    assert batch["social_features"].shape == (2, 7), "Social features shape mismatch!"
+    assert batch["social_features"].shape == (2, 8), "Social features shape mismatch!"
     assert batch["label"].shape == (2,), "Labels shape mismatch!"
     print("\n[OK] ALL STEP 1 CHECKS PASSED SUCCESSFULLY!")
 

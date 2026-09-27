@@ -21,10 +21,17 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .config import VMTFConfig
-from .dataset import create_dataloaders
-from .losses import VMTFCombinedLoss
-from .models.vmtf_net import VMTFNet
+try:
+    from .config import VMTFConfig
+    from .dataset import create_dataloaders
+    from .losses import VMTFCombinedLoss
+    from .models.vmtf_net import VMTFNet
+except (ImportError, ValueError):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from vmtf_net.config import VMTFConfig
+    from vmtf_net.dataset import create_dataloaders
+    from vmtf_net.losses import VMTFCombinedLoss
+    from vmtf_net.models.vmtf_net import VMTFNet
 
 logging.basicConfig(
     level=logging.INFO,
@@ -87,7 +94,7 @@ class VMTFTrainer:
 
         # 4. Mixed Precision Scaler for Kaggle T4 GPU
         self.use_amp = config.use_amp and self.device.type == "cuda"
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = torch.amp.GradScaler(self.device.type, enabled=self.use_amp)
 
         # Checkpointing state
         self.best_val_f1 = -1.0
@@ -119,7 +126,7 @@ class VMTFTrainer:
             self.optimizer.zero_grad()
 
             # Mixed precision forward pass
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.amp.autocast(self.device.type, enabled=self.use_amp):
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -181,7 +188,7 @@ class VMTFTrainer:
             social_features = batch["social_features"].to(self.device)
             targets = batch["label"].to(self.device)
 
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.amp.autocast(self.device.type, enabled=self.use_amp):
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -287,6 +294,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fusion_type", type=str, default="hybrid_proposed", choices=["hybrid_proposed", "late_concat"])
     parser.add_argument("--consistency_lambda", type=float, default=0.1, help="Consistency loss weight")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="Directory for checkpoints")
+    parser.add_argument(
+        "--social_preset",
+        type=str,
+        default="basic",
+        choices=["basic", "extended"],
+        help="Social features preset ('basic': 3 features, 'extended': 8 features)",
+    )
+    parser.add_argument("--test_csv", type=str, default="data/test.csv", help="Path to test CSV")
     return parser.parse_args()
 
 
@@ -303,15 +318,17 @@ def main() -> None:
         fusion_type=args.fusion_type,
         consistency_lambda=args.consistency_lambda,
         checkpoint_dir=args.checkpoint_dir,
+        social_preset=args.social_preset,
     )
 
     set_seed(cfg.seed)
 
     # 1. Build DataLoaders
-    train_loader, val_loader, _, _ = create_dataloaders(
+    train_loader, val_loader, test_loader, _ = create_dataloaders(
         config=cfg,
         train_data=cfg.train_csv,
         val_data=cfg.val_csv if os.path.exists(cfg.val_csv) else None,
+        test_data=args.test_csv if os.path.exists(args.test_csv) else None,
     )
 
     # 2. Build VMTF-Net

@@ -29,9 +29,15 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .config import VMTFConfig
-from .dataset import VMTFCollate, VMTFDataset
-from .models.vmtf_net import VMTFNet
+try:
+    from .config import VMTFConfig
+    from .dataset import VMTFCollate, VMTFDataset, SocialFeatureNormalizer
+    from .models.vmtf_net import VMTFNet
+except (ImportError, ValueError):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from vmtf_net.config import VMTFConfig
+    from vmtf_net.dataset import VMTFCollate, VMTFDataset, SocialFeatureNormalizer
+    from vmtf_net.models.vmtf_net import VMTFNet
 
 logging.basicConfig(
     level=logging.INFO,
@@ -177,6 +183,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test_csv", type=str, default="data/test.csv", help="Path to test CSV")
     parser.add_argument("--image_dir", type=str, default="data/images", help="Root directory of images")
     parser.add_argument("--output_json", type=str, default="logs/evaluation_results.json", help="Path to output JSON")
+    parser.add_argument(
+        "--social_preset",
+        type=str,
+        default=None,
+        choices=["basic", "extended"],
+        help="Override social features preset ('basic': 3 features, 'extended': 8 features). "
+             "If not set, uses preset from saved checkpoint config.",
+    )
     return parser.parse_args()
 
 
@@ -190,11 +204,18 @@ def main() -> None:
     logger.info(f"Loading checkpoint from {args.checkpoint} on {device}")
 
     # 1. Load Checkpoint
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config_dict = checkpoint.get("config", {})
     cfg = VMTFConfig.from_dict(config_dict)
     cfg.test_csv = args.test_csv
     cfg.image_dir = args.image_dir
+
+    # Override social preset if specified via CLI
+    if args.social_preset is not None:
+        cfg.social_preset = args.social_preset
+        cfg.__post_init__()
+
+    logger.info(f"Restored config: social_preset={cfg.social_preset}, social_input_dim={cfg.social_input_dim}")
 
     # 2. Build Model & Load Weights
     model = VMTFNet(cfg).to(device)

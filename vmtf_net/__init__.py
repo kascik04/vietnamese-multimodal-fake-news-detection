@@ -3,7 +3,7 @@ VMTF-Net: Vietnamese Multimodal Transformer Fusion Network
 for Social Media Fake News Detection.
 """
 
-from .config import VMTFConfig
+from .config import VMTFConfig, BASIC_SOCIAL_COLS, EXTENDED_SOCIAL_COLS
 
 try:
     from .dataset import (

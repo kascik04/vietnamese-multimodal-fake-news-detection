@@ -10,6 +10,7 @@ Calculates:
 """
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -58,6 +59,42 @@ def json_default(obj: Any) -> Any:
 
 
 # ----------------------------------------------------------------------
+# Mixed precision (fp16 on T4 / P100 / V100, bf16 on A100)
+# ----------------------------------------------------------------------
+def _is_ampere_or_newer() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
+
+
+def resolve_amp_dtype(amp_dtype: str = "auto") -> torch.dtype:
+    """
+    'auto' -> bf16 on Ampere+ (A100, L4, RTX 30xx+), fp16 otherwise.
+    (torch.cuda.is_bf16_supported() is not used alone: it reports True on T4 through slow emulation.)
+    """
+    if amp_dtype == "bf16":
+        if torch.cuda.is_available() and not _is_ampere_or_newer():
+            logger.warning("bf16 requested on a pre-Ampere GPU: it is emulated and slow. Prefer --amp_dtype fp16.")
+        return torch.bfloat16
+    if amp_dtype == "fp16":
+        return torch.float16
+    return torch.bfloat16 if _is_ampere_or_newer() else torch.float16
+
+
+def setup_cuda_precision(allow_tf32: bool = True) -> None:
+    """Enable TF32 matmuls / convolutions on Ampere+ GPUs (no effect on T4 / V100)."""
+    if allow_tf32 and _is_ampere_or_newer():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logger.info("TF32 enabled (Ampere+ GPU).")
+
+
+def autocast_context(device: torch.device, enabled: bool, dtype: Optional[torch.dtype] = None):
+    """Autocast on CUDA when enabled, a no-op context otherwise."""
+    if not enabled or device.type != "cuda":
+        return contextlib.nullcontext()
+    return torch.amp.autocast("cuda", dtype=dtype or torch.float16)
+
+
+# ----------------------------------------------------------------------
 # Inference
 # ----------------------------------------------------------------------
 def move_batch(batch: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -80,9 +117,11 @@ def run_inference(
     criterion: Optional[torch.nn.Module] = None,
     desc: str = "Evaluating",
     disable_tqdm: bool = False,
+    amp_dtype: Optional[torch.dtype] = None,
 ) -> Dict[str, Any]:
     """
     Run the model over a loader and collect everything needed for metrics and analysis.
+    `amp_dtype`: autocast dtype when use_amp (fp16 if None; bf16 on A100 via resolve_amp_dtype).
 
     Returns:
         Dict with numpy arrays: 'ids', 'y_true' (None if unlabeled), 'prob_fake',
@@ -96,7 +135,7 @@ def run_inference(
 
     for batch in tqdm(data_loader, desc=desc, leave=False, disable=disable_tqdm, mininterval=5):
         inputs = move_batch(batch, device)
-        with torch.amp.autocast(device.type, enabled=use_amp):
+        with autocast_context(device, use_amp, amp_dtype):
             outputs = model(**inputs)
 
         if criterion is not None and "label" in batch:
@@ -401,6 +440,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visual_model_name", type=str, default=None, help="Local path override for the visual backbone")
     parser.add_argument("--n_bootstrap", type=int, default=1000, help="Bootstrap resamples for 95%% CIs (0 to skip)")
     parser.add_argument("--no_tqdm", action="store_true", help="Disable progress bars")
+    parser.add_argument("--amp_dtype", type=str, default=None, choices=["auto", "fp16", "bf16"],
+                        help="Mixed precision type (default: auto = bf16 on A100, fp16 on T4/V100)")
     return parser.parse_args()
 
 
@@ -446,11 +487,16 @@ def main() -> None:
     # 2. Decision threshold: CLI > tuned on val > stored in checkpoint > 0.5
     threshold = 0.5
     use_amp = cfg.use_amp and device.type == "cuda"
+    if args.amp_dtype:
+        cfg.amp_dtype = args.amp_dtype
+    amp_dtype = resolve_amp_dtype(cfg.amp_dtype)
+    setup_cuda_precision(cfg.allow_tf32)
     if args.threshold is not None:
         threshold = args.threshold
     elif args.val_csv:
         val_loader = create_eval_loader(cfg, args.val_csv, normalizer, style_normalizer=style_normalizer)
-        val_out = run_inference(model, val_loader, device, use_amp, desc="Validation", disable_tqdm=cfg.disable_tqdm)
+        val_out = run_inference(model, val_loader, device, use_amp, desc="Validation",
+                                disable_tqdm=cfg.disable_tqdm, amp_dtype=amp_dtype)
         if val_out["y_true"] is not None:
             threshold = find_best_threshold(val_out["y_true"], val_out["prob_fake"])
     elif checkpoint.get("best_threshold") is not None:
@@ -459,7 +505,8 @@ def main() -> None:
 
     # 3. Test inference
     test_loader = create_eval_loader(cfg, cfg.test_csv, normalizer, style_normalizer=style_normalizer)
-    out = run_inference(model, test_loader, device, use_amp, desc="Testing", disable_tqdm=cfg.disable_tqdm)
+    out = run_inference(model, test_loader, device, use_amp, desc="Testing",
+                        disable_tqdm=cfg.disable_tqdm, amp_dtype=amp_dtype)
     results = build_report(out, threshold, n_bootstrap=args.n_bootstrap, seed=cfg.seed)
     results["experiment"] = cfg.experiment_name()
     results["checkpoint"] = os.path.abspath(args.checkpoint)

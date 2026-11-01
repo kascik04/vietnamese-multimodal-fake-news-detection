@@ -39,11 +39,14 @@ try:
         build_report,
         compute_metrics,
         find_best_threshold,
+        autocast_context,
         json_default,
         move_batch,
         print_evaluation_summary,
+        resolve_amp_dtype,
         run_inference,
         save_predictions,
+        setup_cuda_precision,
     )
     from .losses import VMTFCombinedLoss
     from .models.vmtf_net import VMTFNet
@@ -56,11 +59,14 @@ except (ImportError, ValueError):
         build_report,
         compute_metrics,
         find_best_threshold,
+        autocast_context,
         json_default,
         move_batch,
         print_evaluation_summary,
+        resolve_amp_dtype,
         run_inference,
         save_predictions,
+        setup_cuda_precision,
     )
     from vmtf_net.losses import VMTFCombinedLoss
     from vmtf_net.models.vmtf_net import VMTFNet
@@ -161,11 +167,14 @@ class VMTFTrainer:
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=total_steps)
 
         # 4. Mixed Precision Scaler (fp16; T4/P100 have no bf16)
+        # fp16 on T4 / P100 / V100 needs loss scaling; bf16 (A100, auto) has the fp32 range and does not
         self.use_amp = config.use_amp and self.device.type == "cuda"
+        self.amp_dtype = resolve_amp_dtype(config.amp_dtype) if self.use_amp else torch.float32
+        use_scaler = self.use_amp and self.amp_dtype == torch.float16
         try:
-            self.scaler = torch.amp.GradScaler(self.device.type, enabled=self.use_amp)
+            self.scaler = torch.amp.GradScaler(self.device.type, enabled=use_scaler)
         except (AttributeError, TypeError):  # torch < 2.3
-            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+            self.scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
         # Checkpointing / early-stopping state
         self.start_epoch = 0
@@ -278,7 +287,7 @@ class VMTFTrainer:
             inputs = move_batch(batch, self.device)
             targets = batch["label"].to(self.device, non_blocking=True)
 
-            with torch.amp.autocast(self.device.type, enabled=self.use_amp):
+            with autocast_context(self.device, self.use_amp, self.amp_dtype):
                 outputs = self.model(**inputs)
                 loss, loss_dict = self.criterion(outputs, targets, inputs.get("image_mask"))
 
@@ -291,7 +300,7 @@ class VMTFTrainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 # When AMP skips a step (inf/nan grads) the scale decreases: do not advance the LR schedule
-                if not self.use_amp or self.scaler.get_scale() >= scale_before:
+                if not self.scaler.is_enabled() or self.scaler.get_scale() >= scale_before:
                     self.scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
 
@@ -313,7 +322,8 @@ class VMTFTrainer:
     def validate(self, data_loader: DataLoader, desc: str = "Validation") -> Dict[str, Any]:
         """Validation metrics at threshold 0.5 (the threshold is tuned only once, after training)."""
         out = run_inference(
-            self.model, data_loader, self.device, self.use_amp, self.criterion, desc, self.config.disable_tqdm
+            self.model, data_loader, self.device, self.use_amp, self.criterion, desc, self.config.disable_tqdm,
+            amp_dtype=self.amp_dtype,
         )
         if out["y_true"] is None:
             raise ValueError("The validation split must contain valid 0/1 labels.")
@@ -326,7 +336,7 @@ class VMTFTrainer:
     def fit(self) -> None:
         """Complete training workflow with checkpointing and early stopping."""
         logger.info(f"Starting training for {self.config.num_epochs} epochs on {self.device}")
-        logger.info(f"Experiment: {self.config.experiment_name()} | AMP: {self.use_amp}")
+        logger.info(f"Experiment: {self.config.experiment_name()} | AMP: {self.use_amp} ({str(self.amp_dtype).replace('torch.', '')})")
 
         for epoch in range(self.start_epoch, self.config.num_epochs):
             t0 = time.perf_counter()
@@ -412,7 +422,7 @@ class VMTFTrainer:
         if self.val_loader is not None:
             val_out = run_inference(
                 self.model, self.val_loader, self.device, self.use_amp, self.criterion,
-                "Validation (best)", self.config.disable_tqdm,
+                "Validation (best)", self.config.disable_tqdm, amp_dtype=self.amp_dtype,
             )
             threshold = find_best_threshold(val_out["y_true"], val_out["prob_fake"])
             results["val"] = build_report(val_out, threshold, n_bootstrap=0, seed=self.config.seed)
@@ -424,7 +434,8 @@ class VMTFTrainer:
 
         if test_loader is not None:
             test_out = run_inference(
-                self.model, test_loader, self.device, self.use_amp, self.criterion, "Testing", self.config.disable_tqdm
+                self.model, test_loader, self.device, self.use_amp, self.criterion, "Testing", self.config.disable_tqdm,
+                amp_dtype=self.amp_dtype,
             )
             results["test"] = build_report(test_out, threshold, n_bootstrap=n_bootstrap, seed=self.config.seed)
             save_predictions(os.path.join(self.config.checkpoint_dir, "test_predictions.csv"), test_out, threshold)
@@ -482,6 +493,9 @@ def parse_args() -> argparse.Namespace:
     # Runtime
     parser.add_argument("--num_workers", type=int, default=None, help="DataLoader workers (auto if omitted)")
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument("--amp_dtype", type=str, default="auto", choices=["auto", "fp16", "bf16"],
+                        help="Mixed precision type: auto = bf16 on A100 (Ampere+), fp16 on T4/P100/V100")
+    parser.add_argument("--no_tf32", action="store_true", help="Disable TF32 matmuls on Ampere+ GPUs")
     parser.add_argument("--no_multi_gpu", action="store_true", help="Use a single GPU even if more are visible")
     parser.add_argument("--no_tqdm", action="store_true", help="Disable progress bars (Kaggle 'Save & Run All')")
     parser.add_argument("--checkpoint_dir", type=str, default=None,
@@ -543,6 +557,8 @@ def main() -> None:
         early_stopping_patience=args.patience,
         seed=args.seed,
         multi_gpu=not args.no_multi_gpu,
+        amp_dtype=args.amp_dtype,
+        allow_tf32=not args.no_tf32,
         disable_tqdm=args.no_tqdm,
         checkpoint_dir=args.checkpoint_dir or "./checkpoints",
         log_dir=args.log_dir,
@@ -569,6 +585,7 @@ def main() -> None:
     print(cfg)
 
     set_seed(cfg.seed)
+    setup_cuda_precision(cfg.allow_tf32)
     run_start = time.perf_counter()
 
     # 1. Build DataLoaders (social normalizer fitted on train only)
@@ -612,6 +629,9 @@ def main() -> None:
         "experiment": cfg.experiment_name(),
         "environment": environment_info(),
         "parameters": params,
+        "precision": {"amp": trainer.use_amp, "amp_dtype": str(trainer.amp_dtype).replace("torch.", ""),
+                      "tf32": bool(torch.backends.cuda.matmul.allow_tf32) if torch.cuda.is_available() else False,
+                      "num_workers": cfg.num_workers, "gpus_used": max(trainer.num_gpus, 0)},
         "train_samples": len(train_loader.dataset),
         "val_samples": len(val_loader.dataset) if val_loader is not None else 0,
         "test_samples": len(test_loader.dataset) if test_loader is not None else 0,

@@ -51,6 +51,7 @@ scripts/
 ├── validate_and_preprocess_dataset.py  # Schema check, hashing, anti-leakage grouping, splits, K-fold
 ├── run_seeds.py                        # Multi-seed / K-fold runner + mean ± std aggregation
 ├── significance_test.py                # McNemar + paired bootstrap between two models
+├── convert_reintel.py                  # ReINTEL (VLSP 2020) -> 55-column schema
 ├── resize_images.py                    # One-off image downscaling (faster data loading)
 ├── build_claim_kb.py                   # Index the fact-checked claim knowledge base
 └── check_post.py                       # Check one post / evaluate the evidence layer
@@ -66,6 +67,10 @@ docs/DATA_COLLECTION_GUIDE.md           # Data collection & annotation protocol 
 
 ### 3.1 Data sources
 * **Public benchmark (strongly recommended for comparability):** ReINTEL (VLSP 2020) — Vietnamese social-network posts with text, image and `num_like/num_comment/num_share`, matching the `basic` preset. Map `post_message → text`, `num_like_post → like_count`, `num_comment_post → comment_count`, `num_share_post → share_count`, `user_name → source`, `timestamp_post → timestamp`, image file → `image_1_local_path`.
+  Convert it with the dedicated script (column names, unix timestamps, counts like `1,2K`, images by id or URL are handled automatically):
+  ```bash
+  python scripts/convert_reintel.py --input /kaggle/input/reintel/public_train.csv \n      --image_dir /kaggle/input/reintel/images --output data/reintel_vmtf.csv
+  ```
 * **Self-collected data:** follow [`docs/DATA_COLLECTION_GUIDE.md`](docs/DATA_COLLECTION_GUIDE.md) (55-column schema in `data/dataset_template.csv`).
 
 ### 3.2 Validate, de-duplicate & split

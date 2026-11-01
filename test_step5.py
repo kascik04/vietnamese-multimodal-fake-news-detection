@@ -181,6 +181,54 @@ def test_eval_script(kb: ClaimKnowledgeBase) -> None:
     print("    [OK] evaluation passed (time cutoff changes coverage 50% -> 100%, as expected).")
 
 
+def test_convert_reintel(tmp: str) -> None:
+    print("\n[6] ReINTEL -> VMTF schema converter (scripts/convert_reintel.py)...")
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+    from convert_reintel import convert, parse_count, parse_timestamp
+    from validate_and_preprocess_dataset import STANDARD_COLUMNS
+
+    cases = {"12": 12, "12.0": 12, "1,2K": 1200, "3.4k": 3400, "2 tr": 2_000_000, "1.234": 1234,
+             "12,345,678": 12_345_678, "": None, "unknown": None, 7: 7, "-3": None}
+    for raw, expected in cases.items():
+        got = parse_count(raw)
+        assert (expected is None and got != got) or got == expected, f"parse_count({raw!r}) = {got}, expected {expected}"
+    assert parse_timestamp("1584000000") == "2020-03-12 08:00:00"
+    assert parse_timestamp("15/03/2020 10:00") == "2020-03-15 10:00:00"
+    assert parse_timestamp("not a date") == ""
+
+    img_dir = os.path.join(tmp, "reintel_images")
+    os.makedirs(os.path.join(img_dir, "sub"), exist_ok=True)
+    for name in ("101_0.jpg", "101_1.jpg", os.path.join("sub", "abc123.png")):
+        open(os.path.join(img_dir, name), "wb").close()
+
+    raw = pd.DataFrame({
+        "id": ["101", "102", "103", "104"],
+        "user_name": ["u1", "u2", "u1", "u3"],
+        "post_message": ["Tin một", "Tin hai", "Tin ba", "Tin bốn không nhãn"],
+        "timestamp_post": ["1584000000", "1584003600", "", "1584007200"],
+        "num_like_post": ["1,2K", "12.0", "", "5"],
+        "num_comment_post": ["3", "", "1", "0"],
+        "num_share_post": ["0", "7", "2", "1"],
+        "image": ["", "['https://cdn.example.com/x/abc123.png?sig=1']", "https://cdn.example.com/none.jpg", ""],
+        "label": ["1", "0", "0", ""],
+    })
+    out = convert(raw, image_dir=img_dir)
+    assert list(out.columns) == STANDARD_COLUMNS
+    assert len(out) == 3, "Unlabeled row must be dropped by default"
+    r = out.set_index("sample_id")
+    assert r.loc["REINTEL_101", "image_1_local_path"] == "101_0.jpg"       # matched by post id
+    assert r.loc["REINTEL_101", "image_2_local_path"] == "101_1.jpg"
+    assert r.loc["REINTEL_102", "image_1_local_path"] == "sub/abc123.png"   # matched by URL basename
+    assert r.loc["REINTEL_102", "image_1_url"].startswith("https://")
+    assert r.loc["REINTEL_103", "image_1_local_path"] == ""                 # URL without local file
+    assert r.loc["REINTEL_101", "like_count"] == 1200 and r.loc["REINTEL_102", "like_count"] == 12
+    assert r.loc["REINTEL_101", "label"] == 1 and r.loc["REINTEL_101", "raw_label"] == "unreliable"
+    assert r.loc["REINTEL_101", "source"] == "u1" and r.loc["REINTEL_103", "timestamp"] == ""
+    assert len(convert(raw, image_dir=img_dir, keep_unlabeled=True)) == 4
+    print(f"    report: {out.attrs['report']}")
+    print("    [OK] converter passed.")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("RUNNING VMTF-NET STEP 5 CHECKS (style features + evidence layer, offline)")
@@ -191,6 +239,7 @@ if __name__ == "__main__":
         test_sources()
         test_checker(kb)
         test_eval_script(kb)
+        test_convert_reintel(tmp)
     print("\n" + "=" * 60)
     print("[OK] ALL STEP 5 CHECKS PASSED SUCCESSFULLY!")
     print("=" * 60)

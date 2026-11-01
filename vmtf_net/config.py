@@ -22,15 +22,19 @@ def _detect_device() -> str:
 
 def _detect_default_num_workers() -> int:
     """
-    Auto-detect optimal DataLoader workers depending on OS and platform.
-    - Kaggle / Colab: 2 workers (both expose only 2-4 vCPUs).
+    Auto-detect DataLoader workers from the real CPU count of the platform.
+    Text is pre-tokenized, so workers only decode / augment images.
     - Windows: 0 (avoids multiprocessing spawn overhead/issues on Windows).
+    - Kaggle (4 vCPU on GPU sessions): up to 4.
+    - Colab: up to 8 (A100 / high-RAM runtimes expose 8-12 vCPU; a fast GPU needs more workers).
+    - Other Linux: up to 4.
     """
     if os.name == "nt":
         return 0
-    if os.path.exists("/kaggle") or "COLAB_GPU" in os.environ or "COLAB_RELEASE_TAG" in os.environ:
-        return 2
-    return min(4, os.cpu_count() or 1)
+    cpus = os.cpu_count() or 1
+    if "COLAB_GPU" in os.environ or "COLAB_RELEASE_TAG" in os.environ:
+        return max(1, min(8, cpus - 1))
+    return max(1, min(4, cpus))
 
 
 _GENERIC_PATH_PARTS = {"", "default", "main", "transformers", "pytorch", "model", "models", "input", "kaggle"}
@@ -69,7 +73,7 @@ EXTENDED_SOCIAL_COLS: List[str] = [
 FUSION_TYPES: List[str] = ["hybrid_proposed", "late_concat", "text_only", "image_only", "social_only"]
 
 # Hardware-dependent fields: never restored from a checkpoint trained on another machine.
-RUNTIME_FIELDS: List[str] = ["device", "use_amp", "num_workers", "pin_memory", "multi_gpu"]
+RUNTIME_FIELDS: List[str] = ["device", "use_amp", "amp_dtype", "allow_tf32", "num_workers", "pin_memory", "multi_gpu"]
 
 
 @dataclass
@@ -258,7 +262,14 @@ class VMTFConfig:
     """Target compute device ('cuda' or 'cpu')"""
 
     use_amp: bool = True
-    """Enable Automatic Mixed Precision (fp16) on GPU"""
+    """Enable Automatic Mixed Precision on GPU"""
+
+    amp_dtype: str = "auto"
+    """Mixed precision type: 'auto' (bf16 on Ampere+ GPUs such as A100, fp16 on T4/P100/V100), 'fp16', 'bf16'.
+    bf16 has the fp32 range (no loss scaling, no overflow) and is as fast as fp16 on A100."""
+
+    allow_tf32: bool = True
+    """Use TF32 for remaining fp32 matmuls on Ampere+ GPUs (A100): large speed-up, negligible precision loss"""
 
     num_workers: int = field(default_factory=_detect_default_num_workers)
     """Number of DataLoader worker processes (2 on Kaggle/Colab, 0 on Windows)"""
@@ -315,6 +326,8 @@ class VMTFConfig:
             raise ValueError("word_segmenter must be 'auto', 'vncorenlp', 'pyvi' or 'none'.")
         if self.class_weighting not in ("none", "balanced"):
             raise ValueError("class_weighting must be 'none' or 'balanced'.")
+        if self.amp_dtype not in ("auto", "fp16", "bf16"):
+            raise ValueError("amp_dtype must be 'auto', 'fp16' or 'bf16'.")
         self.grad_accum_steps = max(1, int(self.grad_accum_steps))
 
         # If running on CPU, disable AMP and pin_memory automatically

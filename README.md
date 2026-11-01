@@ -58,7 +58,9 @@ scripts/
 
 test_step1.py ... test_step5.py         # Offline tests (no model download; step 5 needs no torch)
 notebooks/kaggle_quickstart.ipynb       # Ready-to-run Kaggle notebook
+notebooks/colab_a100_drive.ipynb       # Colab (A100) notebook with Google Drive storage
 docs/DATA_COLLECTION_GUIDE.md           # Data collection & annotation protocol (Vietnamese)
+docs/EXPERIMENT_PLAN.md                 # GPU budget & experiment schedule (Vietnamese)
 ```
 
 ---
@@ -91,7 +93,7 @@ The script prints a leakage report and warns about empty / single-class splits.
 
 ## 4. Quick Start on Kaggle (GPU T4 x2 or P100) / Colab
 
-Open [`notebooks/kaggle_quickstart.ipynb`](notebooks/kaggle_quickstart.ipynb) or run:
+Open [`notebooks/kaggle_quickstart.ipynb`](notebooks/kaggle_quickstart.ipynb) (Kaggle) or [`notebooks/colab_a100_drive.ipynb`](notebooks/colab_a100_drive.ipynb) (Colab + Google Drive). The GPU-hour budget and run schedule are in [`docs/EXPERIMENT_PLAN.md`](docs/EXPERIMENT_PLAN.md). Or run:
 
 ```bash
 !pip install -q pyvi imagehash            # torch / transformers are pre-installed on Kaggle & Colab
@@ -128,6 +130,7 @@ experiments never share a folder. Training refuses to write into a folder that a
 ### Kaggle / Colab tips
 * **Session limits (Kaggle 12 h, Colab disconnects):** re-run with `--resume <dir>/last_checkpoint.pt`.
 * **T4 x2:** both GPUs are used automatically (DataParallel; disable with `--no_multi_gpu`).
+* **A100 (Colab):** `--amp_dtype auto` (default) uses **bf16 + TF32** on Ampere GPUs and fp16 on T4/P100/V100; DataLoader workers are scaled to the vCPU count. Copy data from Drive to `/content` before training.
 * **Out of memory:** `--gradient_checkpointing`, or `--batch_size 8 --grad_accum_steps 2` (same effective batch).
 * **Internet off:** add PhoBERT / ViT as a Kaggle Model or Dataset and pass local paths: `--text_model_name /kaggle/input/phobert-base --visual_model_name /kaggle/input/vit-base-patch16-224`.
 * **Best PhoBERT segmentation:** `pip install py_vncorenlp` (Java required) and add `--vncorenlp_dir /kaggle/working/vncorenlp` (models are downloaded automatically). Without it, pyvi is used.

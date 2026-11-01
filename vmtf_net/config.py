@@ -139,6 +139,16 @@ class VMTFConfig:
     """Dropout probability for social MLP"""
 
     # ==========================================
+    # 3b. STYLE / CLICKBAIT FEATURES (optional branch)
+    # ==========================================
+    use_style_features: bool = False
+    """Add hand-crafted sensational-style features (exclamations, CAPS, clickbait terms, alarm emojis,
+    share requests...) as an extra branch. Only for experiments that use text."""
+
+    style_hidden_dim: int = 32
+    """Output dimension of the style MLP"""
+
+    # ==========================================
     # 4. FUSION MECHANISM & ABLATION STUDY
     # ==========================================
     fusion_type: str = "hybrid_proposed"
@@ -333,6 +343,16 @@ class VMTFConfig:
             return True
         return self.fusion_type in ("hybrid_proposed", "late_concat") and self.use_social
 
+    @property
+    def uses_style(self) -> bool:
+        return self.use_style_features and self.fusion_type in ("hybrid_proposed", "late_concat", "text_only")
+
+    @property
+    def aux_dim(self) -> int:
+        """Size of the auxiliary vector [E_S ; E_style] concatenated in the fusion head."""
+        dim = self.social_hidden_dim if (self.uses_social and self.fusion_type != "social_only") else 0
+        return dim + (self.style_hidden_dim if self.uses_style else 0)
+
     def experiment_name(self) -> str:
         """
         Tag describing the experiment (used as default output directory, logs and results).
@@ -357,6 +377,8 @@ class VMTFConfig:
             parts.append(_short_model_name(self.visual_model_name))
         if self.uses_social:
             parts.append(f"social-{self.social_preset}")
+        if self.uses_style:
+            parts.append("style")
         if self.use_focal_loss:
             parts.append(f"focal{self.focal_gamma}")
         if self.class_weighting != "none":

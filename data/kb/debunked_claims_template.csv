@@ -1,0 +1,4 @@
+claim_id,claim_text,verdict,source_name,source_url,published_at,topic,notes
+EXAMPLE_0001,Uống nước chanh nóng có thể tiêu diệt virus trong cơ thể chỉ sau vài phút,false,<Tên cơ quan/báo đã bác bỏ>,https://example.com/link-bai-bac-bo,2024-03-12,y_te,Dòng mẫu: thay bằng tin thật đã được kiểm chứng
+EXAMPLE_0002,Tỉnh X phát hiện sinh vật lạ dạt vào bờ biển gây hoang mang,misleading,<Tên cơ quan/báo đã bác bỏ>,https://example.com/link-bai-dinh-chinh,2024-06-01,xa_hoi,Dòng mẫu: ảnh cũ bị gán sai địa điểm (out-of-context)
+EXAMPLE_0003,Ngân hàng Nhà nước điều chỉnh lãi suất điều hành từ tháng tới,true,<Tên nguồn chính thống>,https://example.com/link-thong-bao,2024-08-20,kinh_te,Dòng mẫu: verdict=true cho thông tin đã được xác nhận

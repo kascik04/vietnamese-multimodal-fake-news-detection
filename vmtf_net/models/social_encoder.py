@@ -57,3 +57,25 @@ class SocialMetricsEncoder(nn.Module):
             return out
 
         return self.net(social_features)
+
+
+class StyleFeatureEncoder(nn.Module):
+    """
+    Small MLP for the normalized stylistic / clickbait features (see vmtf_net/style_features.py).
+    LayerNorm instead of BatchNorm: independent of batch size (DataParallel splits, batch of 1).
+
+    Structure:
+        Input [B, n_style] -> Linear(style_hidden) -> LayerNorm -> ReLU -> Dropout -> E_style [B, style_hidden]
+    """
+
+    def __init__(self, config: VMTFConfig, in_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, config.style_hidden_dim),
+            nn.LayerNorm(config.style_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config.social_dropout),
+        )
+
+    def forward(self, style_features: torch.Tensor) -> torch.Tensor:
+        return self.net(style_features)

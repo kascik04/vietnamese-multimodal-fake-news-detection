@@ -119,6 +119,11 @@ def run_tests() -> None:
         dict(fusion_type="text_only"),
         dict(fusion_type="image_only"),
         dict(fusion_type="social_only"),
+        dict(fusion_type="hybrid_proposed", use_style_features=True),
+        dict(fusion_type="hybrid_proposed", use_style_features=True, use_social=False),
+        dict(fusion_type="late_concat", use_style_features=True),
+        dict(fusion_type="text_only", use_style_features=True),
+        dict(fusion_type="image_only", use_style_features=True),  # style ignored without text
     ]
     for v in variants:
         vcfg = VMTFConfig(**v, **common)
@@ -131,6 +136,7 @@ def run_tests() -> None:
             social_feat=es if vcfg.uses_social else None,
             attention_mask=mask,
             image_mask=image_mask if vcfg.uses_image else None,
+            style_feat=torch.randn(B, vcfg.style_hidden_dim) if vcfg.uses_style else None,
         )
         assert out.shape == (B, vcfg.fusion_dim), f"{vcfg.experiment_name()} wrong shape"
         print(f"    - {vcfg.experiment_name():<55} OK (gate: {'yes' if gw else 'no'})")

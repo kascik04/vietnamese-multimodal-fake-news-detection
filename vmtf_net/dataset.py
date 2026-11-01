@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 from .config import VMTFConfig
+from .style_features import STYLE_FEATURE_NAMES, extract_style_dataframe
 
 # Permit loading of slightly damaged/truncated social media images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -271,6 +272,7 @@ class VMTFDataset(Dataset):
         image_processor: Optional[Any] = None,
         social_normalizer: Optional[SocialFeatureNormalizer] = None,
         is_train: bool = True,
+        style_normalizer: Optional[SocialFeatureNormalizer] = None,
     ) -> None:
         """
         Args:
@@ -280,6 +282,7 @@ class VMTFDataset(Dataset):
             image_processor: HuggingFace image processor (provides normalization mean/std).
             social_normalizer: Normalizer fitted on the TRAINING split. Required for val/test.
             is_train: Flag for training mode (enables augmentation).
+            style_normalizer: Style-feature normalizer fitted on the TRAINING split (if use_style_features).
         """
         self.config = config
         self.is_train = is_train
@@ -331,6 +334,9 @@ class VMTFDataset(Dataset):
                 self.df = self.df[~invalid].reset_index(drop=True)
                 parsed = parsed[~invalid].reset_index(drop=True)
             self.labels = parsed.astype(int).values
+
+        # Raw (unsegmented) texts, shared by tokenization and style features
+        self.raw_texts: List[str] = ["" if pd.isna(t) else str(t) for t in self.df[self.text_col].tolist()]
 
         # 3. Text: segment + tokenize ONCE (instead of every __getitem__ call of every epoch)
         self.input_ids: Optional[List[List[int]]] = None
@@ -387,6 +393,20 @@ class VMTFDataset(Dataset):
             self.social_normalizer = SocialFeatureNormalizer(config.social_feature_cols)
             self.normalized_social = self.social_normalizer.fit_transform(self.df)
 
+        # 6. Style / clickbait features (computed on raw text; log1p + scaler fitted on train)
+        self.style_normalizer: Optional[SocialFeatureNormalizer] = None
+        self.normalized_style: Optional[np.ndarray] = None
+        if config.uses_style:
+            style_df = extract_style_dataframe(self.raw_texts)
+            if style_normalizer is not None:
+                self.style_normalizer = style_normalizer
+                self.normalized_style = style_normalizer.transform(style_df)
+            else:
+                if not is_train:
+                    logger.warning("No style_normalizer supplied for a non-training split: fitting on this split.")
+                self.style_normalizer = SocialFeatureNormalizer(STYLE_FEATURE_NAMES)
+                self.normalized_style = self.style_normalizer.fit_transform(style_df)
+
         self.ids: List[str] = self.df[self.id_col].astype(str).tolist()
         self.has_image_flags: np.ndarray = np.array([p is not None for p in self.image_paths], dtype=bool)
 
@@ -405,10 +425,7 @@ class VMTFDataset(Dataset):
 
     def _pretokenize(self) -> List[List[int]]:
         """Word-segment and tokenize all texts once, optionally caching to disk."""
-        texts = [
-            "" if pd.isna(t) else str(t)
-            for t in self.df[self.text_col].tolist()
-        ]
+        texts = self.raw_texts
 
         cache_path = None
         if self.config.cache_dir:
@@ -495,6 +512,9 @@ class VMTFDataset(Dataset):
         if self.input_ids is not None:
             item["input_ids"] = torch.tensor(self.input_ids[idx], dtype=torch.long)
 
+        if self.normalized_style is not None:
+            item["style_features"] = torch.from_numpy(self.normalized_style[idx])
+
         if self.config.uses_image:
             image, ok = self._load_image(self.image_paths[idx])
             if ok:
@@ -548,6 +568,9 @@ class VMTFCollate:
             collated["input_ids"] = input_ids
             collated["attention_mask"] = attention_mask
 
+        if "style_features" in batch[0]:
+            collated["style_features"] = torch.stack([item["style_features"] for item in batch], dim=0)
+
         if "pixel_values" in batch[0]:
             collated["pixel_values"] = torch.stack([item["pixel_values"] for item in batch], dim=0)
             collated["has_image"] = torch.stack([item["has_image"] for item in batch], dim=0)
@@ -593,8 +616,9 @@ def create_eval_loader(
     social_normalizer: SocialFeatureNormalizer,
     tokenizer: Optional[Any] = None,
     image_processor: Optional[Any] = None,
+    style_normalizer: Optional[SocialFeatureNormalizer] = None,
 ) -> DataLoader:
-    """Build a deterministic loader for val/test data using the TRAINING social normalizer."""
+    """Build a deterministic loader for val/test data using the TRAINING social/style normalizers."""
     if config.uses_text and tokenizer is None:
         tokenizer = load_tokenizer(config)
     dataset = VMTFDataset(
@@ -604,6 +628,7 @@ def create_eval_loader(
         image_processor=image_processor,
         social_normalizer=social_normalizer,
         is_train=False,
+        style_normalizer=style_normalizer,
     )
     return _make_loader(dataset, config, config.val_batch_size, shuffle=False, pad_id=_pad_id(tokenizer))
 
@@ -622,7 +647,8 @@ def create_dataloaders(
     to avoid data leakage across splits.
 
     Returns:
-        Tuple of (train_loader, val_loader, test_loader, fitted_social_normalizer)
+        Tuple of (train_loader, val_loader, test_loader, fitted_social_normalizer).
+        The fitted style normalizer (if any) is `train_loader.dataset.style_normalizer`.
     """
     # 1. Load HuggingFace Tokenizer and Image Processor once
     if config.uses_text and tokenizer is None:
@@ -641,16 +667,21 @@ def create_dataloaders(
         is_train=True,
     )
     social_normalizer = train_dataset.social_normalizer
+    style_normalizer = train_dataset.style_normalizer
     train_loader = _make_loader(train_dataset, config, config.batch_size, shuffle=True, pad_id=pad_id)
 
-    # 3. Validation / Test DataLoaders reuse the fitted normalizer
+    # 3. Validation / Test DataLoaders reuse the fitted normalizers
     val_loader = None
     if val_data is not None:
-        val_loader = create_eval_loader(config, val_data, social_normalizer, tokenizer, image_processor)
+        val_loader = create_eval_loader(
+            config, val_data, social_normalizer, tokenizer, image_processor, style_normalizer
+        )
 
     test_loader = None
     if test_data is not None:
-        test_loader = create_eval_loader(config, test_data, social_normalizer, tokenizer, image_processor)
+        test_loader = create_eval_loader(
+            config, test_data, social_normalizer, tokenizer, image_processor, style_normalizer
+        )
 
     logger.info(
         f"DataLoaders successfully built: Train samples={len(train_dataset)}, "

@@ -11,7 +11,8 @@ import torch.nn.functional as F
 
 from ..config import VMTFConfig
 from .fusion import MultimodalFusion
-from .social_encoder import SocialMetricsEncoder
+from ..style_features import STYLE_FEATURE_NAMES
+from .social_encoder import SocialMetricsEncoder, StyleFeatureEncoder
 from .text_encoder import PhoBERTTextEncoder
 from .visual_encoder import ViTVisualEncoder
 
@@ -74,6 +75,9 @@ class VMTFNet(nn.Module):
         self.text_encoder = PhoBERTTextEncoder(config, pretrained_backbones) if config.uses_text else None
         self.visual_encoder = ViTVisualEncoder(config, pretrained_backbones) if config.uses_image else None
         self.social_encoder = SocialMetricsEncoder(config) if config.uses_social else None
+        self.style_encoder = (
+            StyleFeatureEncoder(config, in_dim=len(STYLE_FEATURE_NAMES)) if config.uses_style else None
+        )
 
         # 2. Shared space for the consistency loss / cosine interpretability
         # (only built when the loss trains it: untrained heads would report a meaningless cosine)
@@ -100,6 +104,7 @@ class VMTFNet(nn.Module):
         pixel_values: Optional[torch.Tensor] = None,
         social_features: Optional[torch.Tensor] = None,
         image_mask: Optional[torch.Tensor] = None,
+        style_features: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """
         Forward pass of VMTF-Net.
@@ -133,6 +138,12 @@ class VMTFNet(nn.Module):
         if self.social_encoder is not None:
             social_feat = self.social_encoder(social_features=social_features)
 
+        style_feat = None
+        if self.style_encoder is not None:
+            if style_features is None:
+                raise ValueError("Model was built with use_style_features=True but no style_features were given.")
+            style_feat = self.style_encoder(style_features)
+
         fused_feat, gate_weights = self.fusion(
             text_tokens=text_tokens,
             text_cls=text_cls,
@@ -141,6 +152,7 @@ class VMTFNet(nn.Module):
             social_feat=social_feat,
             attention_mask=attention_mask,
             image_mask=image_mask,
+            style_feat=style_feat,
         )
 
         logits = self.classifier(fused_feat)

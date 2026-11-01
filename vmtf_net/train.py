@@ -118,6 +118,7 @@ class VMTFTrainer:
         social_normalizer: Optional[SocialFeatureNormalizer] = None,
         class_weights: Optional[torch.Tensor] = None,
         save_last: bool = True,
+        style_normalizer: Optional[SocialFeatureNormalizer] = None,
     ) -> None:
         self.config = config
         self.device = torch.device(config.device)
@@ -127,6 +128,7 @@ class VMTFTrainer:
         self.val_loader = val_loader
         self.social_normalizer = social_normalizer
         self.save_last = save_last
+        self.style_normalizer = style_normalizer
 
         # Multi-GPU (Kaggle T4 x2). DataParallel needs no launcher, unlike DDP, inside notebooks.
         self.num_gpus = torch.cuda.device_count() if self.device.type == "cuda" else 0
@@ -189,6 +191,7 @@ class VMTFTrainer:
                 "model_state_dict": self.base_model.state_dict(),
                 "config": self.config.to_dict(),
                 "social_normalizer": self.social_normalizer.state_dict() if self.social_normalizer else None,
+                "style_normalizer": self.style_normalizer.state_dict() if self.style_normalizer else None,
                 "val_metrics": val_metrics,
                 "best_threshold": threshold,
             },
@@ -206,6 +209,7 @@ class VMTFTrainer:
                 "scaler_state_dict": self.scaler.state_dict(),
                 "config": self.config.to_dict(),
                 "social_normalizer": self.social_normalizer.state_dict() if self.social_normalizer else None,
+                "style_normalizer": self.style_normalizer.state_dict() if self.style_normalizer else None,
                 "trainer_state": {
                     "best_val_f1": self.best_val_f1,
                     "best_val_loss": self.best_val_loss,
@@ -456,6 +460,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_gate", action="store_true", help="Ablation: fixed alpha = beta = 0.5")
     parser.add_argument("--no_contradiction", action="store_true", help="Ablation: remove contradiction feature")
     parser.add_argument("--no_social", action="store_true", help="Ablation: remove social branch")
+    parser.add_argument("--use_style", action="store_true",
+                        help="Add the stylistic / clickbait feature branch (hybrid, late_concat, text_only)")
     # Loss
     parser.add_argument("--consistency_lambda", type=float, default=0.1, help="Consistency loss weight (0 disables)")
     parser.add_argument("--use_focal_loss", action="store_true")
@@ -520,6 +526,7 @@ def main() -> None:
         use_gate=not args.no_gate,
         use_contradiction=not args.no_contradiction,
         use_social=not args.no_social,
+        use_style_features=args.use_style,
         consistency_lambda=args.consistency_lambda,
         use_focal_loss=args.use_focal_loss,
         focal_gamma=args.focal_gamma,
@@ -591,6 +598,7 @@ def main() -> None:
         val_loader=val_loader,
         social_normalizer=social_normalizer,
         class_weights=class_weights,
+        style_normalizer=train_loader.dataset.style_normalizer,
         save_last=not args.no_save_last,
     )
     if args.resume:

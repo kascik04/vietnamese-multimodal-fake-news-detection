@@ -62,6 +62,7 @@ def make_batches(n_batches: int, batch_size: int, seed: int):
     """Synthetic collated batches (fake label correlates with a token & social signal)."""
     import torch
     from vmtf_net.dataset import VMTFCollate
+    from vmtf_net.style_features import STYLE_FEATURE_NAMES
 
     g = torch.Generator().manual_seed(seed)
     collate = VMTFCollate(pad_token_id=1)
@@ -81,6 +82,7 @@ def make_batches(n_batches: int, batch_size: int, seed: int):
                 "pixel_values": torch.randn(3, IMG, IMG, generator=g) * has_image,
                 "has_image": torch.tensor(has_image),
                 "social_features": torch.randn(3, generator=g) + label,
+                "style_features": torch.randn(len(STYLE_FEATURE_NAMES), generator=g) + label,
                 "label": torch.tensor(label),
             })
         batches.append(collate(items))
@@ -98,7 +100,7 @@ def run_tests() -> None:
         return
 
     from vmtf_net.dataset import SocialFeatureNormalizer
-    from vmtf_net.evaluate import load_checkpoint, move_batch, run_inference
+    from vmtf_net.evaluate import load_checkpoint, load_style_normalizer, move_batch, run_inference
     from vmtf_net.losses import VMTFCombinedLoss
     from vmtf_net.models.vmtf_net import VMTFNet
     from vmtf_net.train import VMTFTrainer, set_seed
@@ -118,7 +120,8 @@ def run_tests() -> None:
         dict(), dict(use_cross_attention=False), dict(use_gate=False), dict(use_contradiction=False),
         dict(use_social=False), dict(fusion_type="late_concat"), dict(fusion_type="text_only"),
         dict(fusion_type="image_only"), dict(fusion_type="social_only"), dict(text_pooling="mean"),
-        dict(gradient_checkpointing=True),
+        dict(gradient_checkpointing=True), dict(use_style_features=True),
+        dict(fusion_type="text_only", use_style_features=True), dict(consistency_lambda=0.0),
     ]
     for v in variants:
         cfg = make_config(tmp, text_dir, vis_dir, **v)
@@ -130,6 +133,8 @@ def run_tests() -> None:
         assert out["logits"].shape == (4, 2) and torch.isfinite(loss)
         assert (model.text_encoder is not None) == cfg.uses_text
         assert (model.visual_encoder is not None) == cfg.uses_image
+        assert (model.style_encoder is not None) == cfg.uses_style
+        assert (out["cosine_sim"] is not None) == (cfg.uses_text and cfg.uses_image and cfg.consistency_lambda > 0)
         if out["gate_weights"]:
             assert out["gate_weights"]["beta"][0].item() == 0.0, "No-image sample must have beta = 0"
         print(f"    - {cfg.experiment_name():<55} loss {loss.item():.4f}")
@@ -150,14 +155,20 @@ def run_tests() -> None:
 
     # 3. Trainer fit + checkpoints
     print("\n[3] VMTFTrainer.fit (2 epochs, grad accumulation 2)...")
-    cfg = make_config(tmp, text_dir, vis_dir, grad_accum_steps=2, early_stopping_patience=5)
+    cfg = make_config(tmp, text_dir, vis_dir, grad_accum_steps=2, early_stopping_patience=5, use_style_features=True)
     train_batches = make_batches(4, 4, seed=2)
     val_batches = make_batches(2, 4, seed=3)
     test_batches = make_batches(2, 4, seed=4)
     normalizer = SocialFeatureNormalizer(["share_count", "like_count", "comment_count"]).fit(
         pd.DataFrame({"share_count": [1, 10, 100], "like_count": [5, 50, 500], "comment_count": [0, 3, 30]})
     )
-    trainer = VMTFTrainer(cfg, VMTFNet(cfg), train_batches, val_batches, social_normalizer=normalizer)
+    from vmtf_net.style_features import STYLE_FEATURE_NAMES, extract_style_dataframe
+
+    style_normalizer = SocialFeatureNormalizer(STYLE_FEATURE_NAMES).fit(
+        extract_style_dataframe(["SỐC!!! chia sẻ gấp", "Thông báo lịch nghỉ lễ.", "KHẨN CẤP ⚠️"])
+    )
+    trainer = VMTFTrainer(cfg, VMTFNet(cfg), train_batches, val_batches, social_normalizer=normalizer,
+                          style_normalizer=style_normalizer)
     trainer.fit()
     for name in ("best_vmtf_model.pt", "last_checkpoint.pt", "history.csv"):
         assert os.path.exists(os.path.join(cfg.checkpoint_dir, name)), f"{name} missing"
@@ -167,8 +178,10 @@ def run_tests() -> None:
 
     # 4. Resume
     print("\n[4] Resume from last_checkpoint.pt...")
-    cfg_resume = make_config(tmp, text_dir, vis_dir, num_epochs=3, checkpoint_dir=os.path.join(tmp, "ckpt_resume"))
-    resumed = VMTFTrainer(cfg_resume, VMTFNet(cfg_resume), train_batches, val_batches, social_normalizer=normalizer)
+    cfg_resume = make_config(tmp, text_dir, vis_dir, num_epochs=3, use_style_features=True,
+                             checkpoint_dir=os.path.join(tmp, "ckpt_resume"))
+    resumed = VMTFTrainer(cfg_resume, VMTFNet(cfg_resume), train_batches, val_batches, social_normalizer=normalizer,
+                          style_normalizer=style_normalizer)
     resumed.resume(os.path.join(cfg.checkpoint_dir, "last_checkpoint.pt"))
     assert resumed.start_epoch == 2 and len(resumed.history) == 2
     resumed.fit()
@@ -194,6 +207,9 @@ def run_tests() -> None:
         os.path.join(cfg.checkpoint_dir, "best_vmtf_model.pt"), torch.device("cpu")
     )
     assert norm2 is not None and np.allclose(norm2.scaler.mean_, normalizer.scaler.mean_)
+    style2 = load_style_normalizer(ckpt)
+    assert cfg2.uses_style and style2 is not None
+    assert np.allclose(style2.scaler.mean_, style_normalizer.scaler.mean_)
     assert ckpt["best_threshold"] == results["threshold"]
     out_a = run_inference(trainer.base_model, test_batches, torch.device("cpu"), disable_tqdm=True)
     out_b = run_inference(model2, test_batches, torch.device("cpu"), disable_tqdm=True)

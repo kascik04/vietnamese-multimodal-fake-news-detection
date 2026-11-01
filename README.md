@@ -42,6 +42,8 @@ vmtf_net/
 │   ├── fusion.py         # Cross-attention, contradiction, gated fusion, late concat, unimodal
 │   └── vmtf_net.py       # Full model, consistency projection heads, parameter groups
 ├── losses.py             # Focal Loss, masked Text-Image Consistency Loss, Combined Loss
+├── style_features.py     # Clickbait / sensational-style features + explanations (no torch)
+├── retrieval/            # Evidence layer: claim KB search, source credibility, PostChecker
 ├── train.py              # AMP, grad accumulation, DataParallel, resume, history, final test
 └── evaluate.py           # Metrics + bootstrap CIs, threshold tuning, interpretability, predictions CSV
 
@@ -49,9 +51,11 @@ scripts/
 ├── validate_and_preprocess_dataset.py  # Schema check, hashing, anti-leakage grouping, splits, K-fold
 ├── run_seeds.py                        # Multi-seed / K-fold runner + mean ± std aggregation
 ├── significance_test.py                # McNemar + paired bootstrap between two models
-└── resize_images.py                    # One-off image downscaling (faster data loading)
+├── resize_images.py                    # One-off image downscaling (faster data loading)
+├── build_claim_kb.py                   # Index the fact-checked claim knowledge base
+└── check_post.py                       # Check one post / evaluate the evidence layer
 
-test_step1.py ... test_step4.py         # Offline tests (no model download needed)
+test_step1.py ... test_step5.py         # Offline tests (no model download; step 5 needs no torch)
 notebooks/kaggle_quickstart.ipynb       # Ready-to-run Kaggle notebook
 docs/DATA_COLLECTION_GUIDE.md           # Data collection & annotation protocol (Vietnamese)
 ```
@@ -88,7 +92,7 @@ Open [`notebooks/kaggle_quickstart.ipynb`](notebooks/kaggle_quickstart.ipynb) or
 !pip install -q pyvi imagehash            # torch / transformers are pre-installed on Kaggle & Colab
 
 # Offline tests (seconds, no download)
-!python test_step1.py && python test_step2.py && python test_step3.py && python test_step4.py
+!python test_step1.py && python test_step2.py && python test_step3.py && python test_step4.py && python test_step5.py
 
 # Optional: shrink images once (inputs are read-only on Kaggle)
 !python scripts/resize_images.py --input_dir /kaggle/input/<dataset>/images --output_dir /kaggle/working/images
@@ -154,6 +158,8 @@ The decision threshold is taken from `--threshold`, else tuned on `--val_csv`, e
 | Image only (ViT) | `--fusion_type image_only` |
 | Social only (MLP) | `--fusion_type social_only` |
 | ViSoBERT backbone | `--text_model_name uitnlp/visobert` (segmentation is disabled automatically) |
+| + style / clickbait branch | `--use_style` (on top of any of the above that uses text) |
+| Text + style (cheap strong baseline) | `--fusion_type text_only --use_style` |
 
 ### 5.2 Several seeds or K-fold (report mean ± std)
 
@@ -188,7 +194,46 @@ Reports McNemar's exact test and a paired bootstrap CI / p-value for ΔMacro-F1 
 
 ---
 
-## 6. Social Feature Presets
+## 6. Style Features & Evidence Layer (Phase 1)
+
+VMTF-Net judges how a post *looks* (style, image, engagement). Two complementary, interpretable
+components are provided:
+
+**a) Style / clickbait branch** ([`vmtf_net/style_features.py`](vmtf_net/style_features.py), `--use_style`):
+14 hand-crafted signals (exclamations, repeated punctuation, CAPS ratio, alarm emojis ⚠️🔥🚨,
+Vietnamese clickbait terms "sốc / khẩn cấp / thần dược...", calls to share, URLs, hashtags...),
+also detected in text typed without diacritics. They are log-scaled, standardized on the training split
+(stored in the checkpoint) and fed through a small MLP into the fusion head. `explain_style()` turns them
+into user-facing explanations. Sensational style is a *signal*, not proof: also evaluate on real news with
+sensational titles.
+
+**b) Evidence layer** ([`vmtf_net/retrieval/`](vmtf_net/retrieval/)), independent of the neural model:
+
+| Component | Role |
+|---|---|
+| `ClaimKnowledgeBase` | Fact-checked claims (debunked / verified, source link, date) + similarity search (TF-IDF char+word offline, or a sentence-embedding model). Long posts are matched window by window. |
+| `SourceCredibility` | Domains in the post: `trusted` (official / mainstream, `*.gov.vn`), `lookalike` (typo-squatting `vnexpres.net`, embedding `vnexpress.net.tin-nong.xyz`, `tuoitre-news.online`), `unknown` |
+| `PostChecker` | Combines KB matches, sources, style signals and the model P(fake) into a cautious hint + Vietnamese message (never a bare "FAKE" verdict) |
+
+```bash
+# 1. Fill data/kb/debunked_claims.csv (template: data/kb/debunked_claims_template.csv), then index it
+python scripts/build_claim_kb.py --kb_csv data/kb/debunked_claims.csv --out_dir data/kb/index
+
+# 2. Check one post (what an extension backend would call)
+python scripts/check_post.py --kb_dir data/kb/index --post_time 2024-05-01 --model_prob 0.83 \
+    --text "KHẨN CẤP!!! Chia sẻ gấp: uống nước chanh nóng diệt virus..."
+
+# 3. Evaluate the evidence layer on a labeled split (coverage / precision per threshold, clickbait AUC)
+python scripts/check_post.py --kb_dir data/kb/index --eval_csv data/test.csv --output_json logs/evidence_eval.json
+```
+
+**Anti-leakage rule:** evaluation cuts the KB at each post's `timestamp` (`--time_cutoff post`, default): a
+post can only be matched with refutations published *before* it. Without the cutoff, the refutation of the
+test post itself is found and results are unrealistically good (report both if you want to show the gap).
+
+---
+
+## 7. Social Feature Presets
 
 | Preset | Features | Config |
 |---|---|---|
@@ -199,7 +244,7 @@ Missing ratio values are computed from the base counts; existing values are kept
 
 ---
 
-## 7. Environment Compatibility
+## 8. Environment Compatibility
 
 | Environment | Workers | AMP | Pin Memory | Multi-GPU |
 |---|---|---|---|---|
@@ -212,7 +257,7 @@ Hardware fields (device, AMP, workers, pin memory) are re-detected when a checkp
 
 ---
 
-## 8. Future Work
+## 9. Future Work
 * OCR of text embedded in images (screenshots are frequent in Vietnamese fake news) as a fourth modality.
 * Vision-language backbones (CLIP / SigLIP) whose image and text spaces are already aligned.
 * Attention-map / Grad-CAM visualizations for qualitative error analysis.

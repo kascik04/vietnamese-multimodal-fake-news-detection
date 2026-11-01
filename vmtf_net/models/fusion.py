@@ -191,7 +191,12 @@ class ReliabilityAwareGatedFusion(nn.Module):
         use_gate: bool = True,
         use_social: bool = True,
         use_contradiction: bool = True,
+        aux_dim: Optional[int] = None,
     ) -> None:
+        """
+        aux_dim: size of the auxiliary vector concatenated after the gated representation
+            ([E_S] and/or [E_style]). Defaults to social_hidden_dim if use_social else 0.
+        """
         super().__init__()
         d_model = config.text_dim  # 768
         dropout = config.gate_dropout
@@ -206,10 +211,10 @@ class ReliabilityAwareGatedFusion(nn.Module):
                 nn.Linear(128, 2),
             )
 
-        # gated_multimodal (768) [+ social (128)] [+ contradiction (384)]
-        combined_dim = d_model
-        if use_social:
-            combined_dim += config.social_hidden_dim
+        # gated_multimodal (768) [+ social (128)] [+ style (32)] [+ contradiction (384)]
+        if aux_dim is None:
+            aux_dim = config.social_hidden_dim if use_social else 0
+        combined_dim = d_model + aux_dim
         if use_contradiction:
             combined_dim += d_model // 2
 
@@ -270,9 +275,11 @@ class LateConcatFusion(nn.Module):
     [E_T; E_V; E_S] followed by linear projection.
     """
 
-    def __init__(self, config: VMTFConfig, use_social: bool = True) -> None:
+    def __init__(self, config: VMTFConfig, use_social: bool = True, aux_dim: Optional[int] = None) -> None:
         super().__init__()
-        total_in = config.text_dim + config.visual_dim + (config.social_hidden_dim if use_social else 0)
+        if aux_dim is None:
+            aux_dim = config.social_hidden_dim if use_social else 0
+        total_in = config.text_dim + config.visual_dim + aux_dim
         self.projection = nn.Sequential(
             nn.Linear(total_in, config.fusion_dim),
             nn.LayerNorm(config.fusion_dim),
@@ -327,6 +334,8 @@ class MultimodalFusion(nn.Module):
         self.config = config
         self.fusion_type = config.fusion_type
         self.use_social = config.uses_social
+        self.use_style = config.uses_style
+        aux_dim = config.aux_dim  # [E_S ; E_style] (each optional)
 
         if self.fusion_type == "hybrid_proposed":
             self.use_cross_attention = config.use_cross_attention
@@ -340,11 +349,12 @@ class MultimodalFusion(nn.Module):
                 use_gate=config.use_gate,
                 use_social=self.use_social,
                 use_contradiction=self.use_contradiction,
+                aux_dim=aux_dim,
             )
         elif self.fusion_type == "late_concat":
-            self.late_concat = LateConcatFusion(config, use_social=self.use_social)
+            self.late_concat = LateConcatFusion(config, use_social=self.use_social, aux_dim=aux_dim)
         elif self.fusion_type == "text_only":
-            self.unimodal = UnimodalProjection(config.text_dim, config)
+            self.unimodal = UnimodalProjection(config.text_dim + aux_dim, config)
         elif self.fusion_type == "image_only":
             self.unimodal = UnimodalProjection(config.visual_dim, config)
         elif self.fusion_type == "social_only":
@@ -361,6 +371,7 @@ class MultimodalFusion(nn.Module):
         social_feat: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_mask: Optional[torch.Tensor] = None,
+        style_feat: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Unified fusion execution.
@@ -373,23 +384,30 @@ class MultimodalFusion(nn.Module):
             social_feat: [B, 128]
             attention_mask: [B, L]
             image_mask: [B]
+            style_feat: [B, style_hidden_dim] (optional style branch)
 
         Returns:
             Tuple of:
                 - fused_representation: [B, fusion_dim (768)]
                 - gate_weights: Dict containing 'alpha' and 'beta' tensors (hybrid only)
         """
-        if not self.use_social:
-            social_feat = None
-
-        if self.fusion_type == "text_only":
-            return self.unimodal(text_cls)
         if self.fusion_type == "image_only":
             return self.unimodal(visual_cls)
         if self.fusion_type == "social_only":
             return self.unimodal(social_feat)
+
+        # Auxiliary vector [E_S ; E_style] (each part optional)
+        aux_parts = []
+        if self.use_social and social_feat is not None:
+            aux_parts.append(social_feat)
+        if self.use_style and style_feat is not None:
+            aux_parts.append(style_feat)
+        aux_feat = torch.cat(aux_parts, dim=-1) if aux_parts else None
+
+        if self.fusion_type == "text_only":
+            return self.unimodal(text_cls if aux_feat is None else torch.cat([text_cls, aux_feat], dim=-1))
         if self.fusion_type == "late_concat":
-            return self.late_concat(text_cls, visual_cls, social_feat, image_mask)
+            return self.late_concat(text_cls, visual_cls, aux_feat, image_mask)
 
         # Proposed Hybrid Fusion
         # 1. Cross-Modal Attention -> enrich CLS embeddings with attended summaries
@@ -410,7 +428,7 @@ class MultimodalFusion(nn.Module):
         return self.gated_fusion(
             text_cls=enriched_text,
             visual_cls=enriched_visual,
-            social_feat=social_feat,
+            social_feat=aux_feat,
             contradiction_feat=contradiction_feat,
             image_mask=image_mask,
         )

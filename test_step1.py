@@ -175,6 +175,23 @@ def test_dataset_and_dataloader(tmp_dir: str) -> None:
     # Full pass over train (includes the missing-image sample)
     for b in train_loader:
         assert torch.isfinite(b["pixel_values"]).all()
+
+    # Style / clickbait branch: features computed on raw text, normalizer fitted on train only
+    from vmtf_net.style_features import STYLE_FEATURE_NAMES
+
+    cfg.use_style_features = True
+    s_train, s_val, _, _ = create_dataloaders(
+        config=cfg,
+        train_data=os.path.join(data_dir, "train.csv"),
+        val_data=os.path.join(data_dir, "val.csv"),
+        tokenizer=FakeTokenizer(),
+        image_processor=FakeImageProcessor(),
+    )
+    assert s_val.dataset.style_normalizer is s_train.dataset.style_normalizer
+    s_batch = next(iter(s_val))
+    assert s_batch["style_features"].shape == (2, len(STYLE_FEATURE_NAMES))
+    assert torch.isfinite(s_batch["style_features"]).all()
+    print(f"    - style_features shape:  {list(s_batch['style_features'].shape)}")
     print("\n[OK] ALL STEP 1 CHECKS PASSED SUCCESSFULLY!")
 
 

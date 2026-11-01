@@ -63,7 +63,7 @@ def json_default(obj: Any) -> Any:
 def move_batch(batch: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
     """Map a collated batch to VMTFNet.forward keyword arguments on `device`."""
     inputs = {}
-    for key in ("input_ids", "attention_mask", "pixel_values", "social_features"):
+    for key in ("input_ids", "attention_mask", "pixel_values", "social_features", "style_features"):
         if key in batch:
             inputs[key] = batch[key].to(device, non_blocking=True)
     if "has_image" in batch:
@@ -375,6 +375,12 @@ def load_checkpoint(
     return model, cfg, normalizer, checkpoint
 
 
+def load_style_normalizer(checkpoint: Dict[str, Any]) -> Optional[SocialFeatureNormalizer]:
+    """Training-split style-feature normalizer stored in a checkpoint (None if style is unused)."""
+    state = checkpoint.get("style_normalizer")
+    return SocialFeatureNormalizer.from_state_dict(state) if state is not None else None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate trained VMTF-Net checkpoint")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/best_vmtf_model.pt", help="Path to checkpoint")
@@ -432,7 +438,10 @@ def main() -> None:
                 "Pass --train_csv so the normalizer is refit on the training split (never on test)."
             )
         logger.warning("Old checkpoint format: refitting social normalizer on --train_csv.")
-        _, _, _, normalizer = create_dataloaders(cfg, train_data=args.train_csv)
+        train_loader, _, _, normalizer = create_dataloaders(cfg, train_data=args.train_csv)
+        style_normalizer = train_loader.dataset.style_normalizer
+    else:
+        style_normalizer = load_style_normalizer(checkpoint)
 
     # 2. Decision threshold: CLI > tuned on val > stored in checkpoint > 0.5
     threshold = 0.5
@@ -440,7 +449,7 @@ def main() -> None:
     if args.threshold is not None:
         threshold = args.threshold
     elif args.val_csv:
-        val_loader = create_eval_loader(cfg, args.val_csv, normalizer)
+        val_loader = create_eval_loader(cfg, args.val_csv, normalizer, style_normalizer=style_normalizer)
         val_out = run_inference(model, val_loader, device, use_amp, desc="Validation", disable_tqdm=cfg.disable_tqdm)
         if val_out["y_true"] is not None:
             threshold = find_best_threshold(val_out["y_true"], val_out["prob_fake"])
@@ -449,7 +458,7 @@ def main() -> None:
     logger.info(f"Decision threshold: {threshold:.2f}")
 
     # 3. Test inference
-    test_loader = create_eval_loader(cfg, cfg.test_csv, normalizer)
+    test_loader = create_eval_loader(cfg, cfg.test_csv, normalizer, style_normalizer=style_normalizer)
     out = run_inference(model, test_loader, device, use_amp, desc="Testing", disable_tqdm=cfg.disable_tqdm)
     results = build_report(out, threshold, n_bootstrap=args.n_bootstrap, seed=cfg.seed)
     results["experiment"] = cfg.experiment_name()

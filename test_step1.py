@@ -1,11 +1,13 @@
 """
-Verification and Mock Testing Script for VMTF-Net Step 1.
-Generates synthetic Vietnamese fake news data (text, images, social features)
-and validates configuration loading, dataset preprocessing, and batch collation.
+Verification Script for VMTF-Net Step 1 (Config, Dataset, DataLoader) - runs fully OFFLINE.
+Generates synthetic Vietnamese fake news data (text, images, social features) in a temp dir and
+validates configuration round-trip, label filtering, missing-image mask, social normalizer
+serialization, dynamic padding collation and leakage-free normalization.
 """
 
 import os
 import sys
+import tempfile
 
 # Add project root to sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -20,158 +22,169 @@ if hasattr(sys.stdout, "reconfigure"):
 from vmtf_net.config import VMTFConfig
 
 
-def generate_mock_data(data_dir: str = "data") -> None:
+class FakeTokenizer:
+    """Minimal offline stand-in for the PhoBERT tokenizer (<s>=0, <pad>=1, </s>=2)."""
+
+    pad_token_id = 1
+
+    def __call__(self, texts, max_length=256, truncation=True, padding=False, **kwargs):
+        ids = []
+        for t in texts:
+            body = [3 + (sum(map(ord, w)) % 90) for w in t.split()][: max_length - 2]
+            ids.append([0] + body + [2])
+        return {"input_ids": ids}
+
+
+class FakeImageProcessor:
+    image_mean = [0.5, 0.5, 0.5]
+    image_std = [0.5, 0.5, 0.5]
+
+
+def generate_mock_data(data_dir: str) -> None:
     """Generate mock Vietnamese news dataset and sample images for testing."""
     import pandas as pd
     from PIL import Image, ImageDraw
 
     os.makedirs(os.path.join(data_dir, "images"), exist_ok=True)
+    colors = [(220, 50, 50), (50, 180, 50), (50, 100, 220), (200, 200, 50), (90, 90, 90), (10, 200, 200)]
+    for i, color in enumerate(colors, start=1):
+        img = Image.new("RGB", (300, 260), color=color)
+        ImageDraw.Draw(img).text((10, 10), f"news_{i}", fill=(255, 255, 255))
+        img.save(os.path.join(data_dir, "images", f"news_{i}.jpg"))
 
-    # 1. Create dummy images
-    img_names = ["news_1.jpg", "news_2.jpg", "news_3.jpg", "news_4.jpg"]
-    colors = [(220, 50, 50), (50, 180, 50), (50, 100, 220), (200, 200, 50)]
+    def rec(i, text, like, comment, share, angry, haha, label, image=None):
+        return {
+            "sample_id": f"post_{i:03d}",
+            "text": text,
+            "image_1_local_path": image if image is not None else f"news_{i}.jpg",
+            "like_count": like, "comment_count": comment, "share_count": share,
+            "angry_count": angry, "haha_count": haha, "label": label,
+        }
 
-    for name, color in zip(img_names, colors):
-        img_path = os.path.join(data_dir, "images", name)
-        img = Image.new("RGB", (300, 300), color=color)
-        draw = ImageDraw.Draw(img)
-        draw.text((10, 10), name, fill=(255, 255, 255))
-        img.save(img_path)
-
-    # 2. Create sample Vietnamese multimodal records using standard schema columns
-    mock_records = [
-        {
-            "sample_id": "post_001",
-            "text": "Bộ Y Tế chính thức bác bỏ tin đồn thất thiệt lan truyền trên mạng xã hội sáng nay.",
-            "image_1_local_path": "news_1.jpg",
-            "like_count": 1250,
-            "comment_count": 340,
-            "share_count": 120,
-            "angry_count": 15,
-            "haha_count": 30,
-            "label": 0,  # Real News
-        },
-        {
-            "sample_id": "post_002",
-            "text": "Cảnh báo khẩn cấp: Phương pháp chữa bách bệnh bằng lá cây chưa qua kiểm chứng khoa học!",
-            "image_1_local_path": "news_2.jpg",
-            "like_count": 89000,
-            "comment_count": 15400,
-            "share_count": 45000,
-            "angry_count": 31150,
-            "haha_count": 35600,
-            "label": 1,  # Fake News
-        },
-        {
-            "sample_id": "post_003",
-            "text": "Chính phủ phê duyệt dự án phát triển công nghệ cao và trí tuệ nhân tạo quốc gia.",
-            "image_1_local_path": "news_3.jpg",
-            "like_count": 4500,
-            "comment_count": 820,
-            "share_count": 910,
-            "angry_count": 10,
-            "haha_count": 45,
-            "label": 0,  # Real News
-        },
-        {
-            "sample_id": "post_004",
-            "text": "Sốc: Hình ảnh sinh vật lạ xuất hiện tại vùng biển miền Trung gây hoang mang dư luận.",
-            "image_1_local_path": "news_4.jpg",
-            "like_count": 52000,
-            "comment_count": 8700,
-            "share_count": 19500,
-            "angry_count": 13000,
-            "haha_count": 28600,
-            "label": 1,  # Fake News
-        },
+    train = [
+        rec(1, "Bộ Y Tế chính thức bác bỏ tin đồn thất thiệt lan truyền trên mạng xã hội sáng nay.", 1250, 340, 120, 15, 30, 0),
+        rec(2, "Cảnh báo khẩn cấp: Phương pháp chữa bách bệnh bằng lá cây chưa qua kiểm chứng khoa học!", 89000, 15400, 45000, 31150, 35600, 1),
+        rec(3, "Chính phủ phê duyệt dự án phát triển công nghệ cao và trí tuệ nhân tạo quốc gia.", 4500, 820, 910, 10, 45, 0),
+        rec(4, "Sốc: Hình ảnh sinh vật lạ xuất hiện tại vùng biển miền Trung gây hoang mang dư luận.", 52000, 8700, 19500, 13000, 28600, 1, image="missing_file.jpg"),
+        rec(9, "Dòng có nhãn không hợp lệ phải bị loại bỏ.", 1, 1, 1, 0, 0, 7),
     ]
-
-    train_df = pd.DataFrame(mock_records)
-    val_df = pd.DataFrame(mock_records[:2])
-
-    train_csv = os.path.join(data_dir, "train.csv")
-    val_csv = os.path.join(data_dir, "val.csv")
-
-    train_df.to_csv(train_csv, index=False, encoding="utf-8")
-    val_df.to_csv(val_csv, index=False, encoding="utf-8")
-    print(f"[OK] Generated mock dataset at: {train_csv} and {val_csv}")
+    # Validation posts are DIFFERENT from training posts (no leakage)
+    val = [
+        rec(5, "Ngân hàng Nhà nước điều chỉnh lãi suất điều hành từ tháng tới.", 3000, 400, 300, 5, 12, 0),
+        rec(6, "Chia sẻ gấp: uống nước chanh nóng diệt virus trong 5 phút!", 70000, 9000, 30000, 20000, 15000, 1),
+    ]
+    pd.DataFrame(train).to_csv(os.path.join(data_dir, "train.csv"), index=False, encoding="utf-8")
+    pd.DataFrame(val).to_csv(os.path.join(data_dir, "val.csv"), index=False, encoding="utf-8")
+    print(f"[OK] Generated mock dataset in: {data_dir}")
 
 
-def test_config() -> None:
-    """Test VMTFConfig initialization, serialization, and deserialization."""
+def test_config(tmp_dir: str) -> None:
+    """Test VMTFConfig initialization, validation, serialization and runtime-field handling."""
     print("\n--- Testing VMTFConfig ---")
-    cfg = VMTFConfig(
-        batch_size=8,
-        fusion_type="hybrid_proposed",
-        consistency_lambda=0.15,
-    )
-    assert cfg.batch_size == 8
-    assert cfg.social_input_dim == 3
+    cfg = VMTFConfig(batch_size=8, fusion_type="hybrid_proposed", consistency_lambda=0.15,
+                     checkpoint_dir=os.path.join(tmp_dir, "ckpt"), log_dir=os.path.join(tmp_dir, "logs"))
+    assert cfg.batch_size == 8 and cfg.social_input_dim == 3
     print(f"[OK] VMTFConfig initialized:\n{cfg}\n")
 
-    # Test serialization
-    cfg_json_path = "checkpoints/test_config.json"
-    cfg.save(cfg_json_path)
-    loaded_cfg = VMTFConfig.load(cfg_json_path)
-    assert loaded_cfg.consistency_lambda == 0.15
-    assert loaded_cfg.batch_size == 8
-    print(f"[OK] Configuration successfully saved and reloaded from {cfg_json_path}")
+    path = os.path.join(tmp_dir, "ckpt", "test_config.json")
+    cfg.save(path)
+    loaded = VMTFConfig.load(path)
+    assert loaded.consistency_lambda == 0.15 and loaded.batch_size == 8
+
+    # Hardware fields must be re-detected, not copied from another machine
+    d = cfg.to_dict()
+    d["num_workers"] = 99
+    assert VMTFConfig.from_dict(d).num_workers != 99
+    assert VMTFConfig.from_dict(d, restore_runtime=True).num_workers == 99
+
+    ext = VMTFConfig(social_preset="extended", checkpoint_dir=cfg.checkpoint_dir, log_dir=cfg.log_dir)
+    assert ext.social_input_dim == 8
+    try:
+        VMTFConfig(fusion_type="bogus", checkpoint_dir=cfg.checkpoint_dir, log_dir=cfg.log_dir)
+        raise AssertionError("Invalid fusion_type must raise")
+    except ValueError:
+        pass
+    assert "no_gate" in VMTFConfig(use_gate=False, checkpoint_dir=cfg.checkpoint_dir, log_dir=cfg.log_dir).experiment_name()
+    print("[OK] Config save/load, runtime-field reset, presets and validation passed.")
 
 
-def test_dataset_and_dataloader() -> None:
-    """Test VMTFDataset and DataLoader tensor generation."""
+def test_dataset_and_dataloader(tmp_dir: str) -> None:
+    """Test VMTFDataset, social normalizer serialization and DataLoader tensor generation."""
     print("\n--- Testing VMTFDataset & DataLoader ---")
     try:
+        import numpy as np
         import torch
-        from transformers import AutoTokenizer
-        from vmtf_net.dataset import create_dataloaders
+        from vmtf_net.dataset import SocialFeatureNormalizer, create_dataloaders, parse_label
     except ImportError as e:
-        print(f"[!] Torch / Transformers not installed in current local environment: {e}")
-        print("[!] Ready to test seamlessly on Kaggle GPU / Google Colab!")
+        print(f"[!] Torch not installed in current environment: {e}")
         return
+
+    data_dir = os.path.join(tmp_dir, "data")
+    generate_mock_data(data_dir)
 
     cfg = VMTFConfig(
         batch_size=2,
         val_batch_size=2,
-        max_seq_len=64,
+        max_seq_len=16,
         image_size=224,
-        train_csv="data/train.csv",
-        val_csv="data/val.csv",
-        image_dir="data/images",
-        num_workers=0,  # Safe for local test
+        image_dir=os.path.join(data_dir, "images"),
+        num_workers=0,
         social_preset="extended",
+        word_segmenter="none",
+        checkpoint_dir=os.path.join(tmp_dir, "ckpt"),
+        log_dir=os.path.join(tmp_dir, "logs"),
     )
 
-    print("Loading PhoBERT tokenizer & creating dataloaders...")
+    assert parse_label("2") is None and parse_label("fake") == 1 and parse_label(0) == 0
+
     train_loader, val_loader, _, normalizer = create_dataloaders(
         config=cfg,
-        train_data=cfg.train_csv,
-        val_data=cfg.val_csv,
+        train_data=os.path.join(data_dir, "train.csv"),
+        val_data=os.path.join(data_dir, "val.csv"),
+        tokenizer=FakeTokenizer(),
+        image_processor=FakeImageProcessor(),
     )
 
-    batch = next(iter(train_loader))
-    print(f"[OK] Successfully retrieved training batch:")
-    print(f"    - input_ids shape:       {list(batch['input_ids'].shape)}  (Expected: [2, 64])")
-    print(f"    - attention_mask shape:  {list(batch['attention_mask'].shape)}  (Expected: [2, 64])")
+    train_ds = train_loader.dataset
+    assert len(train_ds) == 4, "Row with invalid label 7 must be dropped"
+    assert train_ds.has_image_flags.tolist() == [True, True, True, False], "Missing image must be flagged"
+
+    # Val uses the TRAIN normalizer (no refit on val)
+    assert val_loader.dataset.social_normalizer is normalizer
+
+    # Normalizer survives a checkpoint round-trip
+    restored = SocialFeatureNormalizer.from_state_dict(normalizer.state_dict())
+    assert np.allclose(restored.transform(train_ds.df), normalizer.transform(train_ds.df), atol=1e-6)
+
+    batch = next(iter(val_loader))
+    L = batch["input_ids"].shape[1]
+    print("[OK] Successfully retrieved validation batch:")
+    print(f"    - input_ids shape:       {list(batch['input_ids'].shape)}  (dynamic padding, <= {cfg.max_seq_len})")
     print(f"    - pixel_values shape:    {list(batch['pixel_values'].shape)}  (Expected: [2, 3, 224, 224])")
+    print(f"    - has_image:             {batch['has_image'].tolist()}")
     print(f"    - social_features shape: {list(batch['social_features'].shape)}  (Expected: [2, 8])")
-    print(f"    - label shape:           {list(batch['label'].shape)}  (Expected: [2])")
     print(f"    - labels:                {batch['label'].tolist()}")
 
-    assert batch["input_ids"].shape == (2, 64), "Text input_ids shape mismatch!"
-    assert batch["pixel_values"].shape == (2, 3, 224, 224), "Pixel values shape mismatch!"
-    assert batch["social_features"].shape == (2, 8), "Social features shape mismatch!"
-    assert batch["label"].shape == (2,), "Labels shape mismatch!"
+    assert L <= cfg.max_seq_len
+    assert batch["attention_mask"].shape == batch["input_ids"].shape
+    assert int(batch["attention_mask"].sum(dim=1).max()) == L, "Longest sequence must be unpadded"
+    assert batch["pixel_values"].shape == (2, 3, 224, 224)
+    assert batch["social_features"].shape == (2, 8)
+    assert batch["label"].shape == (2,)
+
+    # Full pass over train (includes the missing-image sample)
+    for b in train_loader:
+        assert torch.isfinite(b["pixel_values"]).all()
     print("\n[OK] ALL STEP 1 CHECKS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":
-    test_config()
-    try:
-        import pandas
-        from PIL import Image
-        generate_mock_data()
-        test_dataset_and_dataloader()
-    except ImportError as e:
-        print(f"\n[Note] Local Python lacks some libraries ({e}).")
-        print("When pushed to Kaggle or run inside an environment with requirements.txt, all tests run end-to-end.")
+    with tempfile.TemporaryDirectory() as tmp:
+        test_config(tmp)
+        try:
+            import pandas  # noqa: F401
+            from PIL import Image  # noqa: F401
+        except ImportError as e:
+            print(f"\n[Note] Local Python lacks some libraries ({e}).")
+        else:
+            test_dataset_and_dataloader(tmp)

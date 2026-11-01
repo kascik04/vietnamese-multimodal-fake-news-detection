@@ -1,15 +1,16 @@
 """
-Verification and Unit Testing Script for VMTF-Net Step 2 (Model Architecture & Fusion).
+Verification and Unit Testing Script for VMTF-Net Step 2 (Model Architecture & Fusion) - OFFLINE.
 Validates:
 1. SocialMetricsEncoder forward pass and output dimension.
-2. CrossModalContradictionAttention (Stage 1) forward pass and tensor shapes.
-3. ReliabilityAwareGatedFusion (Stage 2) and asserts alpha + beta = 1 constraint.
-4. LateConcatFusion baseline (Ablation mode).
-5. Parameter grouping for differential learning rates.
+2. CrossModalAttention + ContradictionModule (Stage 1) shapes and missing-image masking.
+3. ReliabilityAwareGatedFusion (Stage 2): alpha + beta = 1 and beta = 0 without image.
+4. LateConcatFusion and unimodal baselines.
+5. Every hybrid ablation variant (no cross-attention / gate / contradiction / social).
 """
 
 import os
 import sys
+import tempfile
 
 # Add project root to sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -27,147 +28,118 @@ from vmtf_net.config import VMTFConfig
 def run_tests() -> None:
     try:
         import torch
-        import torch.nn as nn
     except ImportError as e:
         print(f"[!] PyTorch is not installed in local environment: {e}")
-        print("[!] Ready to test seamlessly on Kaggle GPU / Google Colab!")
         return
 
-    from vmtf_net.models.social_encoder import SocialMetricsEncoder
     from vmtf_net.models.fusion import (
+        ContradictionModule,
+        CrossModalAttention,
         CrossModalContradictionAttention,
-        ReliabilityAwareGatedFusion,
         LateConcatFusion,
         MultimodalFusion,
+        ReliabilityAwareGatedFusion,
     )
+    from vmtf_net.models.social_encoder import SocialMetricsEncoder
     from vmtf_net.models.vmtf_net import ClassifierHead
 
-    cfg = VMTFConfig(batch_size=4, max_seq_len=32)
-    B = 4
-    L = 32
-    P = 196
-    D = 768
-    D_social = 3
+    tmp = tempfile.mkdtemp()
+    common = dict(checkpoint_dir=os.path.join(tmp, "c"), log_dir=os.path.join(tmp, "l"), device="cpu")
+    cfg = VMTFConfig(batch_size=4, max_seq_len=32, **common)
+    B, L, P, D, D_social = 4, 32, 196, 768, 3
+    torch.manual_seed(0)
 
     print("=" * 60)
     print("RUNNING VMTF-NET STEP 2 ARCHITECTURE CHECKS")
     print("=" * 60)
 
-    # ------------------------------------------------------------------
-    # 1. Social Metrics Encoder Check
-    # ------------------------------------------------------------------
+    # 1. Social Metrics Encoder
     print("\n[1] Testing SocialMetricsEncoder...")
     social_encoder = SocialMetricsEncoder(cfg)
-    mock_social = torch.randn(B, D_social)
-    es = social_encoder(mock_social)
-    print(f"    - Input shape:  {list(mock_social.shape)}")
-    print(f"    - Output shape: {list(es.shape)} (Expected: [{B}, 128])")
+    es = social_encoder(torch.randn(B, D_social))
     assert es.shape == (B, 128), "Social embedding shape mismatch!"
+    assert social_encoder(torch.randn(1, D_social)).shape == (1, 128), "Batch of 1 must work in train mode"
     print("    [OK] SocialMetricsEncoder passed.")
 
-    # ------------------------------------------------------------------
-    # 2. Cross-Modal Attention Check (Stage 1)
-    # ------------------------------------------------------------------
-    print("\n[2] Testing CrossModalContradictionAttention (Stage 1)...")
-    cross_attn = CrossModalContradictionAttention(cfg)
-    mock_text_tokens = torch.randn(B, L, D)
-    mock_patch_tokens = torch.randn(B, P, D)
-    mock_mask = torch.ones(B, L, dtype=torch.long)
-    mock_mask[:, 24:] = 0  # 8 tokens masked as padding
+    # 2. Cross-Modal Attention + Contradiction
+    print("\n[2] Testing CrossModalAttention + ContradictionModule (Stage 1)...")
+    text_tokens = torch.randn(B, L, D)
+    patch_tokens = torch.randn(B, P, D)
+    mask = torch.ones(B, L, dtype=torch.long)
+    mask[:, 24:] = 0
+    image_mask = torch.tensor([1.0, 1.0, 0.0, 1.0])
 
-    t_summary, i_summary, contra_feat = cross_attn(
-        text_tokens=mock_text_tokens,
-        patch_tokens=mock_patch_tokens,
-        attention_mask=mock_mask,
-    )
-    print(f"    - Attended Text Summary:   {list(t_summary.shape)} (Expected: [{B}, {D}])")
-    print(f"    - Attended Image Summary:  {list(i_summary.shape)} (Expected: [{B}, {D}])")
-    print(f"    - Contradiction Features:  {list(contra_feat.shape)} (Expected: [{B}, 384])")
-    assert t_summary.shape == (B, D)
-    assert i_summary.shape == (B, D)
-    assert contra_feat.shape == (B, 384)
-    print("    [OK] CrossModalContradictionAttention passed.")
+    attn = CrossModalAttention(cfg).eval()
+    t_sum, i_sum = attn(text_tokens, patch_tokens, mask, image_mask)
+    assert t_sum.shape == (B, D) and i_sum.shape == (B, D)
+    assert torch.all(i_sum[2] == 0), "Image summary must be zero for a missing image"
 
-    # ------------------------------------------------------------------
-    # 3. Reliability-Aware Gated Fusion Check (Stage 2)
-    # ------------------------------------------------------------------
+    # Text summary of a no-image sample must not depend on the (placeholder) patches
+    t_sum2, _ = attn(text_tokens, torch.randn(B, P, D), mask, image_mask)
+    assert torch.allclose(t_sum[2], t_sum2[2], atol=1e-5), "Missing image leaked into text summary"
+
+    contra_mod = ContradictionModule(cfg).eval()
+    contra = contra_mod(t_sum, i_sum, image_mask)
+    assert contra.shape == (B, 384) and torch.all(contra[2] == 0)
+
+    _, _, contra_compat = CrossModalContradictionAttention(cfg)(text_tokens, patch_tokens, mask, image_mask)
+    assert contra_compat.shape == (B, 384)
+    print("    [OK] Stage 1 shapes and missing-image masking passed.")
+
+    # 3. Gated fusion
     print("\n[3] Testing ReliabilityAwareGatedFusion (Stage 2)...")
-    gated_fusion = ReliabilityAwareGatedFusion(cfg)
-    mock_text_cls = torch.randn(B, D)
-    mock_visual_cls = torch.randn(B, D)
-
-    fused_feat, gate_weights = gated_fusion(
-        text_cls=mock_text_cls,
-        visual_cls=mock_visual_cls,
-        social_feat=es,
-        contradiction_feat=contra_feat,
-    )
-    alpha = gate_weights["alpha"]
-    beta = gate_weights["beta"]
-
-    print(f"    - Fused representation:    {list(fused_feat.shape)} (Expected: [{B}, {D}])")
-    print(f"    - Gate weights alpha:      {alpha.squeeze().tolist()}")
-    print(f"    - Gate weights beta:       {beta.squeeze().tolist()}")
-    
-    # Assert alpha + beta = 1.0 within floating point precision
-    sum_weights = alpha + beta
-    ones = torch.ones_like(sum_weights)
-    assert torch.allclose(sum_weights, ones, atol=1e-6), "Gate constraint alpha + beta = 1 failed!"
-    print(f"    - Constraint alpha + beta = 1 verification: max diff = {(sum_weights - ones).abs().max().item():.8f}")
-    assert fused_feat.shape == (B, D)
+    gated = ReliabilityAwareGatedFusion(cfg)
+    fused, w = gated(torch.randn(B, D), torch.randn(B, D), es, contra, image_mask)
+    alpha, beta = w["alpha"], w["beta"]
+    print(f"    - alpha: {[round(x, 3) for x in alpha.squeeze(-1).tolist()]}")
+    print(f"    - beta:  {[round(x, 3) for x in beta.squeeze(-1).tolist()]}")
+    assert torch.allclose(alpha + beta, torch.ones_like(alpha), atol=1e-6), "alpha + beta = 1 failed!"
+    assert beta[2].item() == 0.0 and alpha[2].item() == 1.0, "beta must be 0 when the image is missing"
+    assert fused.shape == (B, D)
     print("    [OK] ReliabilityAwareGatedFusion passed.")
 
-    # ------------------------------------------------------------------
-    # 4. Ablation Check (Late Concatenation Baseline)
-    # ------------------------------------------------------------------
-    print("\n[4] Testing Baseline Ablation (fusion_type='late_concat')...")
-    cfg_ablation = VMTFConfig(batch_size=B, fusion_type="late_concat")
-    ablation_fusion = MultimodalFusion(cfg_ablation)
-    
-    fused_late, late_weights = ablation_fusion(
-        text_tokens=mock_text_tokens,
-        text_cls=mock_text_cls,
-        patch_tokens=mock_patch_tokens,
-        visual_cls=mock_visual_cls,
-        social_feat=es,
-        attention_mask=mock_mask,
-    )
-    print(f"    - Late concat fused shape: {list(fused_late.shape)} (Expected: [{B}, {D}])")
-    assert fused_late.shape == (B, D)
-    print("    [OK] LateConcatFusion baseline passed.")
+    # 4. Late concat baseline
+    print("\n[4] Testing LateConcatFusion...")
+    late = LateConcatFusion(cfg)
+    fused_late, late_w = late(torch.randn(B, D), torch.randn(B, D), es, image_mask)
+    assert fused_late.shape == (B, D) and late_w == {}
+    print("    [OK] LateConcatFusion passed.")
 
-    # ------------------------------------------------------------------
-    # 5. Proposed Unified Fusion Check
-    # ------------------------------------------------------------------
-    print("\n[5] Testing Proposed Unified MultimodalFusion (fusion_type='hybrid_proposed')...")
-    unified_fusion = MultimodalFusion(cfg)
-    fused_hybrid, hybrid_weights = unified_fusion(
-        text_tokens=mock_text_tokens,
-        text_cls=mock_text_cls,
-        patch_tokens=mock_patch_tokens,
-        visual_cls=mock_visual_cls,
-        social_feat=es,
-        attention_mask=mock_mask,
-    )
-    print(f"    - Proposed hybrid fused shape: {list(fused_hybrid.shape)} (Expected: [{B}, {D}])")
-    assert fused_hybrid.shape == (B, D)
-    print("    [OK] Proposed MultimodalFusion passed.")
+    # 5. Every fusion type / ablation through the unified interface
+    print("\n[5] Testing MultimodalFusion for every experiment configuration...")
+    text_cls, visual_cls = torch.randn(B, D), torch.randn(B, D)
+    variants = [
+        dict(fusion_type="hybrid_proposed"),
+        dict(fusion_type="hybrid_proposed", use_cross_attention=False),
+        dict(fusion_type="hybrid_proposed", use_gate=False),
+        dict(fusion_type="hybrid_proposed", use_contradiction=False),
+        dict(fusion_type="hybrid_proposed", use_social=False),
+        dict(fusion_type="late_concat"),
+        dict(fusion_type="late_concat", use_social=False),
+        dict(fusion_type="text_only"),
+        dict(fusion_type="image_only"),
+        dict(fusion_type="social_only"),
+    ]
+    for v in variants:
+        vcfg = VMTFConfig(**v, **common)
+        fusion = MultimodalFusion(vcfg)
+        out, gw = fusion(
+            text_tokens=text_tokens if vcfg.uses_text else None,
+            text_cls=text_cls if vcfg.uses_text else None,
+            patch_tokens=patch_tokens if vcfg.uses_image else None,
+            visual_cls=visual_cls if vcfg.uses_image else None,
+            social_feat=es if vcfg.uses_social else None,
+            attention_mask=mask,
+            image_mask=image_mask if vcfg.uses_image else None,
+        )
+        assert out.shape == (B, vcfg.fusion_dim), f"{vcfg.experiment_name()} wrong shape"
+        print(f"    - {vcfg.experiment_name():<55} OK (gate: {'yes' if gw else 'no'})")
+    print("    [OK] All fusion variants passed.")
 
-    # ------------------------------------------------------------------
-    # 6. Classifier Head Check
-    # ------------------------------------------------------------------
+    # 6. Classifier Head
     print("\n[6] Testing ClassifierHead...")
-    classifier = ClassifierHead(
-        in_features=cfg.fusion_dim,
-        hidden_dim=cfg.classifier_hidden_dim,
-        num_classes=cfg.num_classes,
-        dropout=cfg.classifier_dropout,
-    )
-    logits = classifier(fused_hybrid)
-    probs = torch.softmax(logits, dim=-1)
-    print(f"    - Logits shape: {list(logits.shape)} (Expected: [{B}, 2])")
-    print(f"    - Probs shape:  {list(probs.shape)} (Expected: [{B}, 2])")
-    assert logits.shape == (B, 2)
+    classifier = ClassifierHead(cfg.fusion_dim, cfg.classifier_hidden_dim, cfg.num_classes, cfg.classifier_dropout)
+    assert classifier(fused).shape == (B, 2)
     print("    [OK] ClassifierHead passed.")
 
     print("\n" + "=" * 60)

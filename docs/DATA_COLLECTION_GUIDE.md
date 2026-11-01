@@ -117,12 +117,25 @@ python scripts/validate_and_preprocess_dataset.py \
 ```
 
 **Script sẽ tự động làm toàn bộ các việc sau:**
-1. Kiểm tra đủ 55 cột, cảnh báo các cột thiếu.
-2. Quét kiểm tra xem file ảnh trong `data/images/` có tồn tại không.
-3. Tự động tính mã SHA-256 và pHash cho từng ảnh.
-4. Tự động tính các tỷ lệ `like_share_ratio`, `comment_share_ratio`, `engagement_ratio`.
-5. Tự động loại bỏ các dòng mẫu `EXAMPLE_` hoặc dòng chưa gán nhãn.
-6. Chia tập dữ liệu thành `train.csv` (70%), `val.csv` (15%), `test.csv` (15%) theo **Group-Stratified Split** (dựa trên `duplicate_group`) để đảm bảo các bài tin repost/copy không xuất hiện ở cả Train và Test split.
+1. Kiểm tra đủ 55 cột, cảnh báo các cột thiếu; loại `sample_id` trùng.
+2. Quét kiểm tra xem file ảnh (cả 3 ô ảnh) có tồn tại không.
+3. Tự động tính SHA-256, pHash, kích thước cho từng ảnh.
+4. Chỉ điền các ô **còn trống** của `like_share_ratio`, `comment_share_ratio`, `engagement_ratio` (giá trị đã có được giữ nguyên).
+5. Loại các dòng mẫu `EXAMPLE_` và các dòng có nhãn không phải 0/1.
+6. **Gom nhóm chống rò rỉ** (`duplicate_group` được tính lại): các bài có cùng `claim_id`/`duplicate_group`, cùng ảnh (SHA-256), ảnh gần giống (pHash) hoặc cùng nội dung văn bản sau chuẩn hóa sẽ luôn nằm chung một tập.
+7. Chia `train/val/test` = 70/15/15 theo **Stratified Group Split** (giữ tỷ lệ tin giả giữa các tập) và in báo cáo kiểm tra rò rỉ.
+
+Các tùy chọn quan trọng cho nghiên cứu:
+
+| Tùy chọn | Ý nghĩa |
+|---|---|
+| `--split_by group` | Mặc định: chia theo nhóm trùng lặp, có stratify theo nhãn |
+| `--split_by source` | Giữ nguyên cả fanpage/nguồn trong một tập → đo khả năng tổng quát hóa sang **nguồn chưa thấy** (tránh mô hình học thuộc "trang X = tin giả") |
+| `--split_by time` | Chia theo thời gian (train tin cũ, test tin mới) → sát thực tế triển khai |
+| `--kfold 5` | Sinh thêm `data/folds/fold_*/` cho 5-fold cross-validation (khi dữ liệu ít) |
+| `--phash_max_distance 5` | Gom cả ảnh gần trùng (crop/nén lại) thay vì chỉ trùng tuyệt đối |
+
+> ⚠️ **Lưu ý về đặc trưng tương tác:** `like/share/angry/haha` được đo **sau khi** bài đã lan truyền. Nếu bài toán là *phát hiện sớm*, hãy báo cáo thêm kết quả với `--no_social` để chứng minh mô hình không phụ thuộc vào thông tin chỉ có sau khi tin giả đã lan rộng.
 
 ---
 
@@ -134,6 +147,7 @@ Khi đưa lên Kaggle GPU hoặc máy trạm huấn luyện, bạn có thể kí
 python -m vmtf_net.train \
     --train_csv data/train.csv \
     --val_csv data/val.csv \
+    --test_csv data/test.csv \
     --image_dir data/images \
     --social_preset extended \
     --batch_size 16 \
@@ -142,3 +156,5 @@ python -m vmtf_net.train \
     --head_lr 1e-4 \
     --fusion_type hybrid_proposed
 ```
+
+Xem `README.md` để biết toàn bộ quy trình ablation, chạy nhiều seed và kiểm định thống kê.

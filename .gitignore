@@ -10,10 +10,7 @@ logs/
 *.pth
 *.bin
 
-# Datasets (keep templates, ignore collected data)
-data/*.csv
-data/images/
-!data/dataset_template.csv
+
 
 # Environments
 .env

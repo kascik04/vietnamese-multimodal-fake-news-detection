@@ -21,9 +21,11 @@ data/images/
 env/
 venv/
 ENV/
+.ssh_colab/
 
 # IDE / System
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+

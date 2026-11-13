@@ -65,6 +65,10 @@ STANDARD_COLUMNS = [
 
 IMAGE_SLOTS = [1, 2, 3]
 
+# Optional columns kept after the 55 standard ones when present
+# (ocr_text: text read inside the images by scripts/ocr_images.py, used with --use_ocr_text)
+OPTIONAL_COLUMNS = ["ocr_text"]
+
 
 def compute_sha256(filepath: str) -> Optional[str]:
     """Compute SHA-256 hash of an image file."""
@@ -145,10 +149,11 @@ def validate_and_preprocess(
         logger.warning(f"Adding missing standard columns with empty defaults: {missing_cols}")
         for c in missing_cols:
             df[c] = np.nan
-    extra_cols = [c for c in df.columns if c not in STANDARD_COLUMNS]
+    kept_optional = [c for c in OPTIONAL_COLUMNS if c in df.columns]
+    extra_cols = [c for c in df.columns if c not in STANDARD_COLUMNS and c not in kept_optional]
     if extra_cols:
         logger.info(f"Dropping non-standard columns: {extra_cols}")
-    df = df[STANDARD_COLUMNS].copy()
+    df = df[STANDARD_COLUMNS + kept_optional].copy()
 
     # 2. Filter out template/mock example rows (starts with 'EXAMPLE_')
     example_mask = df["sample_id"].astype(str).str.startswith("EXAMPLE_")

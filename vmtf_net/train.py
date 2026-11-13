@@ -232,10 +232,20 @@ class VMTFTrainer:
                     "numpy": np.random.get_state(),
                     "torch": torch.get_rng_state(),
                     "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                    # the DataLoader shuffles with its own generator: without it a resumed run
+                    # would replay the batch order of epoch 1
+                    "loader": self._loader_generator().get_state() if self._loader_generator() else None,
                 },
             },
             self.last_path,
         )
+
+    def _loader_generator(self) -> Optional[torch.Generator]:
+        """Shuffling generator of the training DataLoader (None for plain iterables in tests)."""
+        return getattr(self.train_loader, "generator", None)
+
+    def _should_stop_early(self) -> bool:
+        return self.val_loader is not None and self.patience_counter >= self.config.early_stopping_patience
 
     def resume(self, path: str) -> None:
         """Restore a `last_checkpoint.pt` and continue from the next epoch."""
@@ -260,6 +270,8 @@ class VMTFTrainer:
             torch.set_rng_state(rng["torch"])
             if rng.get("cuda") is not None and torch.cuda.is_available():
                 torch.cuda.set_rng_state_all(rng["cuda"])
+            if rng.get("loader") is not None and self._loader_generator() is not None:
+                self._loader_generator().set_state(rng["loader"])
         logger.info(f"Resumed at epoch {self.start_epoch} (best val F1 so far {self.best_val_f1:.4f}).")
 
     # ------------------------------------------------------------------
@@ -269,8 +281,7 @@ class VMTFTrainer:
         """Run one training epoch with gradient accumulation."""
         self.model.train()
         accum = self.config.grad_accum_steps
-        sums = {"total_loss": 0.0, "cls_loss": 0.0, "consistency_loss": 0.0}
-        sums_t = {k: torch.zeros((), device=self.device) for k in sums}
+        sums_t: Dict[str, torch.Tensor] = {}  # filled from the keys of the first loss_dict
         all_preds, all_targets = [], []
         num_batches = len(self.train_loader)
 
@@ -304,8 +315,8 @@ class VMTFTrainer:
                     self.scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
 
-            for k in sums_t:
-                sums_t[k] += loss_dict[k]
+            for k, v in loss_dict.items():
+                sums_t[k] = sums_t[k] + v if k in sums_t else v.clone()
             all_preds.append(outputs["logits"].detach().argmax(dim=-1))
             all_targets.append(targets)
 
@@ -339,6 +350,10 @@ class VMTFTrainer:
         logger.info(f"Experiment: {self.config.experiment_name()} | AMP: {self.use_amp} ({str(self.amp_dtype).replace('torch.', '')})")
 
         for epoch in range(self.start_epoch, self.config.num_epochs):
+            if self._should_stop_early():
+                # resumed from a run that had already hit early stopping: nothing left to train
+                logger.info("Early stopping had already been reached in the resumed run.")
+                break
             t0 = time.perf_counter()
             train_metrics = self.train_epoch(epoch)
             row: Dict[str, Any] = {"epoch": epoch + 1}
@@ -393,7 +408,7 @@ class VMTFTrainer:
             if self.save_last:
                 self._save_last(epoch + 1)
 
-            if self.val_loader is not None and self.patience_counter >= self.config.early_stopping_patience:
+            if self._should_stop_early():
                 logger.info(f"Early stopping triggered after {epoch+1} epochs.")
                 break
 
@@ -461,10 +476,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visual_model_name", type=str, default="google/vit-base-patch16-224")
     parser.add_argument("--max_seq_len", type=int, default=256)
     parser.add_argument("--text_pooling", type=str, default="cls", choices=["cls", "mean"])
+    parser.add_argument("--text_truncation", type=str, default="head", choices=["head", "head_tail"],
+                        help="Long posts: keep the beginning (head) or beginning + end (head_tail)")
+    parser.add_argument("--cache_images", action="store_true",
+                        help="Decode/resize all images once into RAM (~150KB per image): much faster epochs")
     parser.add_argument("--word_segmenter", type=str, default="auto", choices=["auto", "vncorenlp", "pyvi", "none"])
     parser.add_argument("--vncorenlp_dir", type=str, default=None, help="VnCoreNLP model directory (needs Java)")
     parser.add_argument("--freeze_text_layers", type=int, default=0)
     parser.add_argument("--freeze_visual_layers", type=int, default=0)
+    parser.add_argument("--max_images", type=int, default=1, choices=[1, 2, 3],
+                        help="Images used per post (ViT cost grows with the number of images)")
+    parser.add_argument("--use_ocr_text", action="store_true",
+                        help="Append the `ocr_text` column (scripts/ocr_images.py) to the post text")
     # Fusion / ablation
     parser.add_argument("--fusion_type", type=str, default="hybrid_proposed", choices=FUSION_TYPES)
     parser.add_argument("--no_cross_attention", action="store_true", help="Ablation: remove cross-modal attention")
@@ -475,6 +498,8 @@ def parse_args() -> argparse.Namespace:
                         help="Add the stylistic / clickbait feature branch (hybrid, late_concat, text_only)")
     # Loss
     parser.add_argument("--consistency_lambda", type=float, default=0.1, help="Consistency loss weight (0 disables)")
+    parser.add_argument("--gate_entropy_lambda", type=float, default=0.0,
+                        help="Gate entropy bonus (0 = off; 0.01-0.05 if results.json reports a collapsed gate)")
     parser.add_argument("--use_focal_loss", action="store_true")
     parser.add_argument("--focal_gamma", type=float, default=2.0)
     parser.add_argument("--class_weighting", type=str, default="none", choices=["none", "balanced"])
@@ -531,10 +556,14 @@ def main() -> None:
         visual_model_name=args.visual_model_name,
         max_seq_len=args.max_seq_len,
         text_pooling=args.text_pooling,
+        text_truncation=args.text_truncation,
+        cache_images=args.cache_images,
         word_segmenter=args.word_segmenter,
         vncorenlp_dir=args.vncorenlp_dir,
         freeze_text_layers=args.freeze_text_layers,
         freeze_visual_layers=args.freeze_visual_layers,
+        max_images=args.max_images,
+        use_ocr_text=args.use_ocr_text,
         fusion_type=args.fusion_type,
         use_cross_attention=not args.no_cross_attention,
         use_gate=not args.no_gate,
@@ -542,6 +571,7 @@ def main() -> None:
         use_social=not args.no_social,
         use_style_features=args.use_style,
         consistency_lambda=args.consistency_lambda,
+        gate_entropy_lambda=args.gate_entropy_lambda,
         use_focal_loss=args.use_focal_loss,
         focal_gamma=args.focal_gamma,
         class_weighting=args.class_weighting,

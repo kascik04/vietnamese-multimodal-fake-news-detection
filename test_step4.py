@@ -58,7 +58,7 @@ def make_config(tmp: str, text_dir: str, vis_dir: str, **overrides) -> VMTFConfi
     return VMTFConfig(**params)
 
 
-def make_batches(n_batches: int, batch_size: int, seed: int):
+def make_batches(n_batches: int, batch_size: int, seed: int, n_images: int = 1):
     """Synthetic collated batches (fake label correlates with a token & social signal)."""
     import torch
     from vmtf_net.dataset import VMTFCollate
@@ -76,11 +76,19 @@ def make_batches(n_batches: int, batch_size: int, seed: int):
             ids[0], ids[-1] = 0, 2
             ids[1] = 50 + label
             has_image = float(i != 0)  # first sample of every batch has no image
+            if n_images > 1:
+                # sample i has min(i, n_images) images: 0, 1, 2, ...
+                slot_mask = (torch.arange(n_images) < i).float()
+                pixels = torch.randn(n_images, 3, IMG, IMG, generator=g) * slot_mask.view(-1, 1, 1, 1)
+            else:
+                slot_mask = None
+                pixels = torch.randn(3, IMG, IMG, generator=g) * has_image
             items.append({
                 "id": f"s{b}_{i}",
                 "input_ids": ids,
-                "pixel_values": torch.randn(3, IMG, IMG, generator=g) * has_image,
+                "pixel_values": pixels,
                 "has_image": torch.tensor(has_image),
+                **({"image_slot_mask": slot_mask} if slot_mask is not None else {}),
                 "social_features": torch.randn(3, generator=g) + label,
                 "style_features": torch.randn(len(STYLE_FEATURE_NAMES), generator=g) + label,
                 "label": torch.tensor(label),
@@ -138,6 +146,23 @@ def run_tests() -> None:
         if out["gate_weights"]:
             assert out["gate_weights"]["beta"][0].item() == 0.0, "No-image sample must have beta = 0"
         print(f"    - {cfg.experiment_name():<55} loss {loss.item():.4f}")
+    # Several images per post: empty slots are never encoded and never change the output
+    cfg_multi = make_config(tmp, text_dir, vis_dir, max_images=3)
+    multi_batch = make_batches(1, 4, seed=5, n_images=3)[0]
+    assert multi_batch["pixel_values"].shape == (4, 3, 3, IMG, IMG)
+    model_multi = VMTFNet(cfg_multi).eval()
+    with torch.no_grad():
+        inputs = move_batch(multi_batch, torch.device("cpu"))
+        out_a = model_multi(**inputs)
+        garbage = dict(inputs)
+        garbage["pixel_values"] = inputs["pixel_values"].clone()
+        empty = inputs["image_slot_mask"] == 0
+        garbage["pixel_values"][empty] = torch.randn(int(empty.sum()), 3, IMG, IMG)
+        out_b = model_multi(**garbage)
+    assert torch.allclose(out_a["logits"], out_b["logits"], atol=1e-5), "pixels of empty image slots leaked"
+    assert out_a["gate_weights"]["beta"][0].item() == 0.0, "post without any image must have beta = 0"
+    assert "img3" in cfg_multi.experiment_name()
+    print(f"    - {cfg_multi.experiment_name():<55} multi-image masking OK")
     print("    [OK] All variants run forward + backward.")
 
     # 2. Parameter groups
@@ -215,6 +240,43 @@ def run_tests() -> None:
     out_b = run_inference(model2, test_batches, torch.device("cpu"), disable_tqdm=True)
     assert np.allclose(out_a["prob_fake"], out_b["prob_fake"], atol=1e-5), "Reloaded model differs!"
     print("    [OK] Checkpoint round-trip passed.")
+
+    # 7. Single-post prediction API (same preprocessing path as training)
+    print("\n[7] VMTFPredictor...")
+    from PIL import Image
+
+    from vmtf_net.predict import VMTFPredictor
+
+    class _Tok:
+        pad_token_id = 1
+
+        def __call__(self, texts, max_length=SEQ, truncation=True, padding=False, **kw):
+            return {"input_ids": [[0] + [3 + (sum(map(ord, w)) % 90) for w in t.split()][: max_length - 2] + [2]
+                                  for t in texts]}
+
+    class _Proc:
+        image_mean = [0.5, 0.5, 0.5]
+        image_std = [0.5, 0.5, 0.5]
+
+    img_path = os.path.join(tmp, "post.jpg")
+    Image.new("RGB", (80, 60), (200, 40, 40)).save(img_path)
+    predictor = VMTFPredictor(model2, cfg2, norm2, style2, threshold=ckpt["best_threshold"],
+                              device=torch.device("cpu"), tokenizer=_Tok(), image_processor=_Proc())
+    one = predictor.predict("SỐC!!! Chia sẻ gấp tin này", images=[img_path], like_count=1200, share_count=95)
+    assert 0.0 <= one["prob_fake"] <= 1.0 and one["label"] in (0, 1) and one["has_image"] is True
+    assert abs(one["alpha_text"] + one["beta_image"] - 1.0) < 1e-5 and one["style_signals"]
+    text_only_post = predictor.predict("Thông báo lịch nghỉ lễ của trường.")
+    assert text_only_post["has_image"] is False and text_only_post["beta_image"] == 0.0
+    many = predictor.predict_batch([{"text": "bài một", "id": "a"}, {"text": "bài hai", "image": img_path, "id": "b"}])
+    assert [m["id"] for m in many] == ["a", "b"] and many[1]["has_image"]
+    again = predictor.predict("SỐC!!! Chia sẻ gấp tin này", images=[img_path], like_count=1200, share_count=95)
+    assert abs(again["prob_fake"] - one["prob_fake"]) < 1e-6, "prediction must be deterministic"
+
+    from vmtf_net.retrieval import PostChecker
+
+    report = predictor.predict_and_check("Hôm nay trời đẹp.", PostChecker(None))
+    assert report["prediction"]["prob_fake"] == report["model_prob_fake"] and "hint" in report
+    print("    [OK] VMTFPredictor passed.")
 
     print("\n" + "=" * 60)
     print("[OK] ALL STEP 4 END-TO-END CHECKS PASSED SUCCESSFULLY!")

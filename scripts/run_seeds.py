@@ -32,7 +32,7 @@ from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 
-METRICS = ["accuracy", "f1_macro", "f1_fake", "precision_fake", "recall_fake", "auc_roc", "pr_auc"]
+METRICS = ["accuracy", "f1_macro", "f1_fake", "precision_fake", "recall_fake", "auc_roc", "pr_auc", "ece", "brier"]
 
 
 def parse_args():

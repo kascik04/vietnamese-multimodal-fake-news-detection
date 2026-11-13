@@ -105,6 +105,8 @@ def move_batch(batch: Dict[str, Any], device: torch.device) -> Dict[str, torch.T
             inputs[key] = batch[key].to(device, non_blocking=True)
     if "has_image" in batch:
         inputs["image_mask"] = batch["has_image"].to(device, non_blocking=True)
+    if "image_slot_mask" in batch:
+        inputs["image_slot_mask"] = batch["image_slot_mask"].to(device, non_blocking=True)
     return inputs
 
 
@@ -177,6 +179,24 @@ def run_inference(
 # ----------------------------------------------------------------------
 # Metrics
 # ----------------------------------------------------------------------
+def expected_calibration_error(y_true: np.ndarray, prob_fake: np.ndarray, n_bins: int = 10) -> float:
+    """
+    ECE of the binary classifier: |confidence - accuracy| averaged over equal-width confidence bins.
+    Confidence = probability of the predicted class (at 0.5). 0 = perfectly calibrated: among
+    posts shown as "80% fake", 80% really are fake. Matters when the probability is shown to users.
+    """
+    pred = (prob_fake >= 0.5).astype(int)
+    conf = np.where(pred == 1, prob_fake, 1.0 - prob_fake)
+    correct = (pred == y_true).astype(float)
+    bins = np.minimum(((conf - 0.5) / 0.5 * n_bins).astype(int), n_bins - 1)  # conf is in [0.5, 1]
+    ece = 0.0
+    for b in range(n_bins):
+        in_bin = bins == b
+        if in_bin.any():
+            ece += in_bin.mean() * abs(correct[in_bin].mean() - conf[in_bin].mean())
+    return float(ece)
+
+
 def compute_metrics(y_true: np.ndarray, prob_fake: np.ndarray, threshold: float = 0.5) -> Dict[str, Any]:
     """Classification metrics at a decision threshold on P(fake)."""
     y_pred = (prob_fake >= threshold).astype(int)
@@ -193,6 +213,9 @@ def compute_metrics(y_true: np.ndarray, prob_fake: np.ndarray, threshold: float 
         "recall_fake": float(recall_score(y_true, y_pred, pos_label=1, average="binary", zero_division=0)),
         "auc_roc": float(roc_auc_score(y_true, prob_fake)) if both_classes else None,
         "pr_auc": float(average_precision_score(y_true, prob_fake)) if both_classes else None,
+        # Calibration of the probabilities (threshold-independent; lower is better)
+        "brier": float(np.mean((prob_fake - y_true) ** 2)),
+        "ece": expected_calibration_error(y_true, prob_fake),
         "confusion_matrix": confusion_matrix(y_true, y_pred, labels=[0, 1]).tolist(),
     }
 
@@ -268,8 +291,20 @@ def interpretability_analysis(out: Dict[str, Any], threshold: float) -> Dict[str
             analysis["gate_beta_visual_with_image_only"] = {
                 k: _distribution(out["beta"][m & with_image]) for k, m in masks.items()
             }
-        hist, edges = np.histogram(out["beta"], bins=10, range=(0.0, 1.0))
+        # Histogram / saturation over posts WITH an image only (beta is forced to 0 otherwise)
+        gate_beta = out["beta"][with_image] if with_image is not None else out["beta"]
+        hist, edges = np.histogram(gate_beta, bins=10, range=(0.0, 1.0))
         analysis["gate_beta_histogram"] = {"counts": hist.tolist(), "bin_edges": edges.round(2).tolist()}
+        if len(gate_beta):
+            text_only = float(np.mean(gate_beta < 0.05))
+            image_only = float(np.mean(gate_beta > 0.95))
+            analysis["gate_saturation"] = {
+                "n_with_image": int(len(gate_beta)),
+                "frac_text_only(beta<0.05)": text_only,
+                "frac_image_only(beta>0.95)": image_only,
+                # collapsed = the gate ignores one modality for (almost) every post
+                "collapsed": bool(max(text_only, image_only) > 0.9),
+            }
 
     if out["cosine"] is not None:
         valid = with_image if with_image is not None else np.ones(len(out["cosine"]), dtype=bool)
@@ -354,6 +389,7 @@ def print_evaluation_summary(results: Dict[str, Any], title: str = "VMTF-NET EVA
     print(f"  Fake Precision/Rec.: {_pct(m['precision_fake'])} / {_pct(m['recall_fake'])}")
     print(f"  AUC-ROC:             {_pct(m['auc_roc'])}{_ci('auc_roc')}")
     print(f"  PR-AUC:              {_pct(m['pr_auc'])}")
+    print(f"  Calibration:         ECE {m['ece']:.3f} | Brier {m['brier']:.3f}  (lower is better)")
     print("-" * 65)
     print("  Confusion Matrix [[TN, FP], [FN, TP]]:")
     for row in m["confusion_matrix"]:
@@ -366,6 +402,13 @@ def print_evaluation_summary(results: Dict[str, Any], title: str = "VMTF-NET EVA
         for k in ("overall", "real", "fake"):
             if gate.get(k):
                 print(f"    - {k:<8} mean {gate[k]['mean']:.3f} | median {gate[k]['median']:.3f} | std {gate[k]['std']:.3f}")
+    sat = interp.get("gate_saturation")
+    if sat:
+        print(f"    - saturation: beta<0.05 for {sat['frac_text_only(beta<0.05)'] * 100:.1f}% | "
+              f"beta>0.95 for {sat['frac_image_only(beta>0.95)'] * 100:.1f}% of posts with image")
+        if sat["collapsed"]:
+            print("    ! Gate collapsed onto one modality: do not interpret alpha/beta as reliability; "
+                  "compare with --no_gate or try --gate_entropy_lambda 0.02")
     cos = interp.get("text_image_cosine")
     if cos:
         print("  Text-image cosine (shared space):")

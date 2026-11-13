@@ -192,6 +192,69 @@ def test_dataset_and_dataloader(tmp_dir: str) -> None:
     assert s_batch["style_features"].shape == (2, len(STYLE_FEATURE_NAMES))
     assert torch.isfinite(s_batch["style_features"]).all()
     print(f"    - style_features shape:  {list(s_batch['style_features'].shape)}")
+
+    # RAM image cache must give exactly the same eval pixels as decoding from disk
+    cfg.use_style_features = False
+    cfg.cache_images = True
+    c_train, c_val, _, _ = create_dataloaders(
+        config=cfg,
+        train_data=os.path.join(data_dir, "train.csv"),
+        val_data=os.path.join(data_dir, "val.csv"),
+        tokenizer=FakeTokenizer(),
+        image_processor=FakeImageProcessor(),
+    )
+    assert c_val.dataset.image_cache is not None and c_val.dataset.image_cache.dtype == np.uint8
+    assert torch.equal(next(iter(c_val))["pixel_values"], batch["pixel_values"]), "cache changed the pixels"
+    assert c_train.dataset.has_image_flags.tolist() == [True, True, True, False]
+    for b in c_train:
+        assert b["pixel_values"].shape[1:] == (3, 224, 224)
+    cfg.cache_images = False
+
+    # head_tail truncation keeps <s>, the beginning, the end and </s>
+    from vmtf_net.dataset import head_tail_truncate
+
+    long_ids = [0] + list(range(100, 200)) + [2]
+    cut = head_tail_truncate(long_ids, 16)
+    assert len(cut) == 16 and cut[0] == 0 and cut[-1] == 2 and cut[1] == 100 and cut[-2] == 199
+    cfg.text_truncation = "head_tail"
+    h_train, _, _, _ = create_dataloaders(
+        config=cfg, train_data=os.path.join(data_dir, "train.csv"),
+        tokenizer=FakeTokenizer(), image_processor=FakeImageProcessor(),
+    )
+    assert max(len(ids) for ids in h_train.dataset.input_ids) <= cfg.max_seq_len
+    print("    - image cache + head_tail truncation: OK")
+    cfg.text_truncation = "head"
+
+    # Several images per post + OCR text appended to the post text
+    import pandas as pd
+
+    multi_df = pd.read_csv(os.path.join(data_dir, "train.csv"))
+    multi_df["image_2_local_path"] = ["news_2.jpg", "", "missing.jpg", "news_1.jpg", ""]
+    multi_df["image_3_local_path"] = ["news_3.jpg", "", "", "", ""]
+    multi_df["ocr_text"] = ["THÔNG BÁO KHẨN của UBND", "", "", "", ""]
+    cfg.max_images = 3
+    cfg.use_ocr_text = True
+    cfg.max_seq_len = 64
+    for cached in (False, True):
+        cfg.cache_images = cached
+        m_train, _, _, _ = create_dataloaders(
+            config=cfg, train_data=multi_df, tokenizer=FakeTokenizer(), image_processor=FakeImageProcessor(),
+        )
+        ds = m_train.dataset
+        assert [len(p) for p in ds.image_lists] == [3, 1, 1, 1], ds.image_lists   # row 4 (bad label) dropped
+        item0, item3 = ds[0], ds[3]
+        assert item0["pixel_values"].shape == (3, 3, 224, 224)
+        assert item0["image_slot_mask"].tolist() == [1.0, 1.0, 1.0] and item0["has_image"].item() == 1.0
+        # post 4: image_1 is missing on disk, image_2 exists -> it fills the first slot
+        assert item3["image_slot_mask"].tolist() == [1.0, 0.0, 0.0]
+        assert torch.all(item3["pixel_values"][1:] == 0)
+        mb = next(iter(m_train))
+        assert mb["pixel_values"].shape[1:] == (3, 3, 224, 224) and mb["image_slot_mask"].shape[1] == 3
+    assert "Chữ trong ảnh" in ds.model_texts[0] and ds.model_texts[1] == ds.raw_texts[1]
+    assert len(ds.input_ids[0]) > len(FakeTokenizer()([ds.raw_texts[0]])["input_ids"][0]), "OCR text not tokenized"
+    assert "Chữ trong ảnh" not in ds.raw_texts[0], "style features must see the post text only"
+    cfg.max_images, cfg.use_ocr_text, cfg.cache_images = 1, False, False
+    print("    - multi-image (max_images=3) + OCR text: OK")
     print("\n[OK] ALL STEP 1 CHECKS PASSED SUCCESSFULLY!")
 
 

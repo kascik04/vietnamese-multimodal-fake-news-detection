@@ -105,6 +105,7 @@ class VMTFNet(nn.Module):
         social_features: Optional[torch.Tensor] = None,
         image_mask: Optional[torch.Tensor] = None,
         style_features: Optional[torch.Tensor] = None,
+        image_slot_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """
         Forward pass of VMTF-Net.
@@ -112,7 +113,9 @@ class VMTFNet(nn.Module):
         Args:
             input_ids: Text token IDs [batch_size, seq_len]
             attention_mask: Text attention mask [batch_size, seq_len]
-            pixel_values: Preprocessed image tensor [batch_size, 3, 224, 224]
+            pixel_values: Preprocessed image tensor [batch_size, 3, 224, 224],
+                or [batch_size, n_images, 3, 224, 224] when max_images > 1
+            image_slot_mask: [batch_size, n_images] float, 1 = slot holds a real image (max_images > 1)
             social_features: Engagement metrics [batch_size, social_input_dim]
             image_mask: [batch_size] float, 1 = image present, 0 = missing (optional)
 
@@ -127,13 +130,15 @@ class VMTFNet(nn.Module):
                 - 'fused_feat': [batch_size, fusion_dim]
                 - 'gate_weights': Dict with 'alpha' [B, 1] and 'beta' [B, 1] (hybrid only)
         """
-        text_tokens = text_cls = patch_tokens = visual_cls = social_feat = None
+        text_tokens = text_cls = patch_tokens = visual_cls = social_feat = patch_mask = None
 
         if self.text_encoder is not None:
             text_tokens, text_cls = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
 
         if self.visual_encoder is not None:
-            patch_tokens, visual_cls = self.visual_encoder(pixel_values=pixel_values)
+            patch_tokens, visual_cls, patch_mask, image_mask = self._encode_images(
+                pixel_values, image_mask, image_slot_mask
+            )
 
         if self.social_encoder is not None:
             social_feat = self.social_encoder(social_features=social_features)
@@ -153,6 +158,7 @@ class VMTFNet(nn.Module):
             attention_mask=attention_mask,
             image_mask=image_mask,
             style_feat=style_feat,
+            patch_mask=patch_mask,
         )
 
         logits = self.classifier(fused_feat)
@@ -175,6 +181,58 @@ class VMTFNet(nn.Module):
             "fused_feat": fused_feat,
             "gate_weights": gate_weights,
         }
+
+    def _encode_images(
+        self,
+        pixel_values: torch.Tensor,
+        image_mask: Optional[torch.Tensor],
+        image_slot_mask: Optional[torch.Tensor],
+    ):
+        """
+        Encode the images of a batch; only slots holding a real image go through the ViT
+        (posts without image cost nothing and can never leak placeholder pixels).
+
+        Args:
+            pixel_values: [B, 3, H, W] or [B, K, 3, H, W]
+            image_mask: [B] (1 = post has an image); used as the slot mask when K = 1
+            image_slot_mask: [B, K] (1 = slot holds a real image)
+
+        Returns:
+            patch_tokens [B, K*P, D] (zeros for empty slots), visual_cls [B, D] (mean over the
+            real images, zeros if none), patch_mask [B, K*P], image_mask [B].
+        """
+        if pixel_values.dim() == 4:
+            pixel_values = pixel_values.unsqueeze(1)
+        batch, n_slots = pixel_values.shape[:2]
+        if image_slot_mask is not None:
+            slot = image_slot_mask
+        elif image_mask is not None:
+            slot = image_mask.reshape(batch, 1).expand(batch, n_slots)
+        else:
+            slot = pixel_values.new_ones(batch, n_slots)
+        valid = slot.reshape(-1) > 0
+        flat = pixel_values.reshape(batch * n_slots, *pixel_values.shape[2:])
+
+        if bool(valid.all()):
+            patches, cls = self.visual_encoder(pixel_values=flat)
+        elif bool(valid.any()):
+            p_valid, c_valid = self.visual_encoder(pixel_values=flat[valid])
+            patches = p_valid.new_zeros(batch * n_slots, p_valid.size(1), p_valid.size(2))
+            cls = c_valid.new_zeros(batch * n_slots, c_valid.size(1))
+            patches[valid] = p_valid
+            cls[valid] = c_valid
+        else:  # no image in this (replica) batch: a single all-masked placeholder patch per slot
+            patches = flat.new_zeros(batch * n_slots, 1, self.config.visual_dim)
+            cls = flat.new_zeros(batch * n_slots, self.config.visual_dim)
+
+        n_patches, dim = patches.shape[1], patches.shape[2]
+        slot_f = slot.to(cls.dtype)
+        patch_tokens = patches.reshape(batch, n_slots * n_patches, dim)
+        visual_cls = (cls.reshape(batch, n_slots, dim) * slot_f.unsqueeze(-1)).sum(dim=1)
+        visual_cls = visual_cls / slot_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+        patch_mask = slot_f.unsqueeze(-1).expand(batch, n_slots, n_patches).reshape(batch, n_slots * n_patches)
+        has_image = (slot_f.sum(dim=1) > 0).to(cls.dtype)
+        return patch_tokens, visual_cls, patch_mask, has_image
 
     def count_parameters(self) -> Dict[str, int]:
         """Total / trainable parameter counts (reported in run_info.json)."""

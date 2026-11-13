@@ -75,7 +75,7 @@ def test_losses() -> None:
     total, parts = combined(outputs, real)
     expected = F.cross_entropy(logits, real) + 0.15 * consistency_fn(text_emb, -text_emb, real)
     assert torch.allclose(total, expected, atol=1e-5)
-    assert set(parts) == {"total_loss", "cls_loss", "consistency_loss"}
+    assert set(parts) == {"total_loss", "cls_loss", "consistency_loss", "gate_entropy"}
     print(f"    - Total {float(parts['total_loss']):.4f} | Cls {float(parts['cls_loss']):.4f} | "
           f"Consistency {float(parts['consistency_loss']):.4f}")
 
@@ -90,6 +90,25 @@ def test_losses() -> None:
     total_g, _ = combined({"logits": lg, "text_proj": tp, "visual_proj": -text_emb}, real)
     total_g.backward()
     assert lg.grad is not None and tp.grad is not None
+    # Gate entropy: logged always, added to the loss only when gate_entropy_lambda > 0
+    import math
+
+    from vmtf_net.losses import gate_entropy_mean
+
+    half = torch.full((B, 1), 0.5)
+    assert abs(gate_entropy_mean(half).item() - math.log(2)) < 1e-5, "H(0.5) = ln 2"
+    assert gate_entropy_mean(torch.zeros(B, 1)).item() < 1e-4, "saturated gate -> ~0 entropy"
+    # posts without image (beta forced to 0) are ignored
+    mixed = torch.tensor([[0.5], [0.5], [0.0], [0.0]])
+    assert abs(gate_entropy_mean(mixed, torch.tensor([1.0, 1.0, 0.0, 0.0])).item() - math.log(2)) < 1e-5
+
+    gate_out = {"logits": logits, "text_proj": None, "visual_proj": None, "gate_weights": {"beta": half}}
+    plain, p_plain = combined(gate_out, real)
+    assert abs(float(p_plain["gate_entropy"]) - math.log(2)) < 1e-5
+    assert torch.allclose(plain, F.cross_entropy(logits, real)), "lambda_gate = 0 must not change the loss"
+    reg = VMTFCombinedLoss(VMTFConfig(consistency_lambda=0.0, gate_entropy_lambda=0.1, **common))
+    total_reg, _ = reg(gate_out, real)
+    assert torch.allclose(total_reg, F.cross_entropy(logits, real) - 0.1 * math.log(2), atol=1e-5)
     print("    [OK] VMTFCombinedLoss passed.")
 
     print("\n" + "=" * 60)

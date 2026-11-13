@@ -106,18 +106,34 @@ class TextImageConsistencyLoss(nn.Module):
         return (loss * weights).sum() / weights.sum().clamp(min=1.0)
 
 
+def gate_entropy_mean(beta: torch.Tensor, image_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    Mean binary entropy H(beta) = -(beta log beta + alpha log alpha), in nats (max ln 2 = 0.693
+    at alpha = beta = 0.5, 0 when the gate is saturated), over posts that have an image
+    (without image beta is forced to 0, which says nothing about the gate).
+    """
+    b = beta.float().reshape(-1).clamp(1e-6, 1.0 - 1e-6)
+    entropy = -(b * b.log() + (1.0 - b) * (1.0 - b).log())
+    if image_mask is None:
+        return entropy.mean()
+    w = image_mask.float().reshape(-1)
+    return (entropy * w).sum() / w.sum().clamp(min=1.0)
+
+
 class VMTFCombinedLoss(nn.Module):
     """
     Combined objective for VMTF-Net:
-    Total_Loss = L_classification + lambda * L_consistency
+    Total_Loss = L_classification + lambda * L_consistency - lambda_gate * H(gate)
     The consistency term is only active when the model exposes text/visual projections
-    (multimodal experiments) and lambda > 0.
+    (multimodal experiments) and lambda > 0. The optional gate-entropy bonus (lambda_gate > 0)
+    keeps the reliability gate from saturating at alpha = 1 or beta = 1.
     """
 
     def __init__(self, config: VMTFConfig, class_weights: Optional[torch.Tensor] = None) -> None:
         super().__init__()
         self.config = config
         self.consistency_lambda = config.consistency_lambda
+        self.gate_entropy_lambda = config.gate_entropy_lambda
 
         # 1. Classification Loss (CrossEntropy or Focal Loss)
         if config.use_focal_loss:
@@ -166,10 +182,19 @@ class VMTFCombinedLoss(nn.Module):
             consistency_loss = torch.zeros((), device=logits.device)
             total_loss = cls_loss
 
+        # Gate entropy (logged for every hybrid run; added to the loss only when lambda_gate > 0)
+        gate_entropy = torch.zeros((), device=logits.device)
+        beta = (model_outputs.get("gate_weights") or {}).get("beta")
+        if beta is not None:
+            gate_entropy = gate_entropy_mean(beta, image_mask)
+            if self.gate_entropy_lambda > 0.0:
+                total_loss = total_loss - self.gate_entropy_lambda * gate_entropy
+
         loss_dict = {
             "total_loss": total_loss.detach(),
             "cls_loss": cls_loss.detach(),
             "consistency_loss": consistency_loss.detach(),
+            "gate_entropy": gate_entropy.detach(),
         }
 
         return total_loss, loss_dict

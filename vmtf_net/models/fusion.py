@@ -68,13 +68,16 @@ class CrossModalAttention(nn.Module):
         patch_tokens: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         image_mask: Optional[torch.Tensor] = None,
+        patch_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             text_tokens: Text sequence tokens [batch_size, seq_len, 768]
             patch_tokens: Visual patch tokens [batch_size, num_patches, 768]
+                (several images: their patches concatenated, num_patches = n_images * 196)
             attention_mask: Text padding mask [batch_size, seq_len] (1 for valid, 0 for pad)
             image_mask: [batch_size] (1 = image present)
+            patch_mask: [batch_size, num_patches] (1 = patch of a real image). None = all valid.
 
         Returns:
             Tuple of:
@@ -84,8 +87,22 @@ class CrossModalAttention(nn.Module):
         # In PyTorch MultiheadAttention, key_padding_mask should be True for padded positions
         key_padding_mask = attention_mask == 0 if attention_mask is not None else None
 
+        # Patches of missing image slots must not be attended to
+        patch_padding = None
+        if patch_mask is not None:
+            if image_mask is None:
+                image_mask = (patch_mask.sum(dim=1) > 0).to(patch_tokens.dtype)
+            invalid = patch_mask <= 0
+            # A post without any image has every patch masked, which would give NaN attention
+            # weights: unmask that row (its tokens are zeros and its output is zeroed below).
+            invalid = invalid & ~invalid.all(dim=1, keepdim=True)
+            if invalid.any():
+                patch_padding = invalid
+
         # A. Text attends to Visual Patches; no visual information is injected for missing images
-        t2i_out, _ = self.text_to_image_attn(query=text_tokens, key=patch_tokens, value=patch_tokens)
+        t2i_out, _ = self.text_to_image_attn(
+            query=text_tokens, key=patch_tokens, value=patch_tokens, key_padding_mask=patch_padding
+        )
         m3 = _expand_mask(image_mask, t2i_out)
         if m3 is not None:
             t2i_out = t2i_out * m3
@@ -106,7 +123,11 @@ class CrossModalAttention(nn.Module):
             key_padding_mask=key_padding_mask,
         )
         refined_image = self.ln_image(patch_tokens + i2t_out)  # [B, P, 768]
-        image_summary = refined_image.mean(dim=1)              # [B, 768]
+        if patch_mask is not None:
+            pm = patch_mask.unsqueeze(-1).to(refined_image.dtype)
+            image_summary = (refined_image * pm).sum(dim=1) / pm.sum(dim=1).clamp(min=1.0)
+        else:
+            image_summary = refined_image.mean(dim=1)          # [B, 768]
         m2 = _expand_mask(image_mask, image_summary)
         if m2 is not None:
             image_summary = image_summary * m2
@@ -372,6 +393,7 @@ class MultimodalFusion(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         image_mask: Optional[torch.Tensor] = None,
         style_feat: Optional[torch.Tensor] = None,
+        patch_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Unified fusion execution.
@@ -385,6 +407,7 @@ class MultimodalFusion(nn.Module):
             attention_mask: [B, L]
             image_mask: [B]
             style_feat: [B, style_hidden_dim] (optional style branch)
+            patch_mask: [B, P] (1 = patch of a real image; several images per post)
 
         Returns:
             Tuple of:
@@ -412,7 +435,9 @@ class MultimodalFusion(nn.Module):
         # Proposed Hybrid Fusion
         # 1. Cross-Modal Attention -> enrich CLS embeddings with attended summaries
         if self.use_cross_attention:
-            text_summary, image_summary = self.cross_attn(text_tokens, patch_tokens, attention_mask, image_mask)
+            text_summary, image_summary = self.cross_attn(
+                text_tokens, patch_tokens, attention_mask, image_mask, patch_mask
+            )
             enriched_text = text_cls + text_summary
             enriched_visual = visual_cls + image_summary
         else:

@@ -11,6 +11,7 @@ import hashlib
 import logging
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -31,6 +32,9 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+OCR_TEXT_COL = "ocr_text"            # optional column written by scripts/ocr_images.py
+OCR_MARKER = "Chữ trong ảnh:"        # separates the post text from the text read inside its images
 
 BASE_COUNT_COLS: List[str] = ["like_count", "comment_count", "share_count", "angry_count", "haha_count"]
 
@@ -252,6 +256,46 @@ def add_derived_social_features(df: pd.DataFrame, feature_cols: List[str]) -> pd
 
 
 # ----------------------------------------------------------------------
+# Image lookup / text truncation helpers
+# ----------------------------------------------------------------------
+_IMAGE_INDEX_CACHE: Dict[str, Tuple[Dict[str, str], Dict[str, str]]] = {}
+
+
+def index_image_dir(image_dir: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    One directory walk -> ({relative posix path: full path}, {file name: full path}).
+    Replaces three os.path.isfile() calls per CSV row (slow on Kaggle / Drive file systems).
+    Cached per process: train / val / test datasets share it.
+    """
+    key = os.path.abspath(image_dir)
+    if key not in _IMAGE_INDEX_CACHE:
+        by_rel: Dict[str, str] = {}
+        by_name: Dict[str, str] = {}
+        if os.path.isdir(key):
+            for root, _, files in os.walk(key):
+                for name in files:
+                    full = os.path.join(root, name)
+                    by_rel[os.path.relpath(full, key).replace(os.sep, "/")] = full
+                    by_name.setdefault(name, full)
+        _IMAGE_INDEX_CACHE[key] = (by_rel, by_name)
+    return _IMAGE_INDEX_CACHE[key]
+
+
+def head_tail_truncate(ids: List[int], max_len: int) -> List[int]:
+    """
+    Keep <s> + first quarter + last three quarters + </s> of an over-long token sequence
+    (head+tail truncation; the end of a post often holds the conclusion / call to share).
+    """
+    if len(ids) <= max_len:
+        return ids
+    body = ids[1:-1]
+    budget = max_len - 2
+    n_head = budget // 4
+    n_tail = budget - n_head
+    return [ids[0]] + body[:n_head] + body[len(body) - n_tail:] + [ids[-1]]
+
+
+# ----------------------------------------------------------------------
 # Dataset
 # ----------------------------------------------------------------------
 class VMTFDataset(Dataset):
@@ -335,8 +379,23 @@ class VMTFDataset(Dataset):
                 parsed = parsed[~invalid].reset_index(drop=True)
             self.labels = parsed.astype(int).values
 
-        # Raw (unsegmented) texts, shared by tokenization and style features
+        # Raw (unsegmented) post texts: used as-is by the style features
         self.raw_texts: List[str] = ["" if pd.isna(t) else str(t) for t in self.df[self.text_col].tolist()]
+
+        # Text fed to the encoder: post text, optionally followed by the text read inside the images
+        # (column `ocr_text`, produced offline by scripts/ocr_images.py)
+        self.model_texts: List[str] = self.raw_texts
+        if config.use_ocr_text:
+            if OCR_TEXT_COL in self.df.columns:
+                ocr = ["" if pd.isna(t) else str(t).strip() for t in self.df[OCR_TEXT_COL].tolist()]
+                self.model_texts = [
+                    f"{t}\n{OCR_MARKER} {o}" if o else t for t, o in zip(self.raw_texts, ocr)
+                ]
+                logger.info(f"OCR text appended for {sum(bool(o) for o in ocr)}/{len(ocr)} samples.")
+            else:
+                logger.warning(
+                    f"use_ocr_text=True but column '{OCR_TEXT_COL}' is missing: run scripts/ocr_images.py first."
+                )
 
         # 3. Text: segment + tokenize ONCE (instead of every __getitem__ call of every epoch)
         self.input_ids: Optional[List[List[int]]] = None
@@ -347,37 +406,47 @@ class VMTFDataset(Dataset):
             self.input_ids = self._pretokenize()
 
         # 4. Images: resolve paths once, build deterministic eval / augmented train transforms
-        self.image_paths: List[Optional[str]] = [None] * len(self.df)
+        self.max_images = max(1, int(config.max_images))
+        self.image_lists: List[List[str]] = [[] for _ in range(len(self.df))]  # existing files, <= max_images
+        self.image_cache: Optional[np.ndarray] = None   # [n_images, size, size, 3] uint8 (cache_images)
+        self._cache_row: Optional[np.ndarray] = None    # [n_samples, max_images] -> row in image_cache (-1 = none)
         if config.uses_image:
             if image_processor is None:
                 image_processor = load_image_processor(config)
             mean = list(getattr(image_processor, "image_mean", None) or [0.5, 0.5, 0.5])
             std = list(getattr(image_processor, "image_std", None) or [0.5, 0.5, 0.5])
             size = config.image_size
-            if self.is_train:
-                # Same full-frame squash as eval first, then a mild crop: otherwise wide images get
-                # center-cropped in training but squashed at test time (train/test mismatch).
-                # No horizontal flip: many fake-news images contain text (screenshots, captions).
-                self.image_transform = transforms.Compose([
-                    transforms.Resize((size, size)),
-                    transforms.RandomResizedCrop((size, size), scale=(0.85, 1.0), ratio=(0.9, 1.1)),
-                    transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=mean, std=std),
-                ])
-            else:
-                self.image_transform = transforms.Compose([
-                    transforms.Resize((size, size)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=mean, std=std),
-                ])
-            self.image_paths = [self._find_image_path(row) for _, row in self.df.iterrows()]
-            n_missing = sum(p is None for p in self.image_paths)
+            # Step 1 (train and eval): full-frame squash to size x size. Cacheable (deterministic).
+            self.resize = transforms.Resize((size, size))
+            # Step 2: train = mild crop + color jitter on the squashed image (no horizontal flip:
+            # many fake-news images contain text); eval = nothing. Then tensor + normalization.
+            augment = [
+                transforms.RandomResizedCrop((size, size), scale=(0.85, 1.0), ratio=(0.9, 1.1)),
+                transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+            ] if self.is_train else []
+            self.post_transform = transforms.Compose(
+                augment + [transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)]
+            )
+
+            by_rel, by_name = index_image_dir(config.image_dir)
+            cols = ([self.image_col] if self.image_col else []) + self.alt_image_cols
+            if cols:
+                # max_images = 1: the first image that exists (image_1, else image_2, else image_3)
+                self.image_lists = [
+                    self._find_image_paths(values, by_rel, by_name, self.max_images)
+                    for values in zip(*(self.df[c].tolist() for c in cols))
+                ]
+            if config.cache_images:
+                self._preload_images()
+            n_missing = sum(not paths for paths in self.image_lists)
             if n_missing:
                 logger.warning(
                     f"{n_missing}/{len(self.df)} samples have no image file on disk "
                     f"(handled with has_image=0, not with a fake placeholder signal)."
                 )
+            if self.max_images > 1:
+                counts = np.bincount([len(p) for p in self.image_lists], minlength=self.max_images + 1)
+                logger.info(f"Images per post (0..{self.max_images}): {counts.tolist()}")
 
         # 5. Social Features Normalization & Auto-completion
         self.df = add_derived_social_features(self.df, config.social_feature_cols)
@@ -408,7 +477,12 @@ class VMTFDataset(Dataset):
                 self.normalized_style = self.style_normalizer.fit_transform(style_df)
 
         self.ids: List[str] = self.df[self.id_col].astype(str).tolist()
-        self.has_image_flags: np.ndarray = np.array([p is not None for p in self.image_paths], dtype=bool)
+        self.has_image_flags: np.ndarray = np.array([bool(paths) for paths in self.image_lists], dtype=bool)
+
+    @property
+    def image_paths(self) -> List[Optional[str]]:
+        """First usable image of every sample (None when the post has no image)."""
+        return [paths[0] if paths else None for paths in self.image_lists]
 
     def _resolve_column_name(self, candidates: List[str], required: bool = True) -> Optional[str]:
         """Find the first matching column name from a list of candidates."""
@@ -425,13 +499,14 @@ class VMTFDataset(Dataset):
 
     def _pretokenize(self) -> List[List[int]]:
         """Word-segment and tokenize all texts once, optionally caching to disk."""
-        texts = self.raw_texts
+        texts = self.model_texts
 
         cache_path = None
         if self.config.cache_dir:
             digest = hashlib.md5()
             digest.update(
-                f"{self.config.text_model_name}|{self.config.max_seq_len}|{self.segmenter_mode}".encode("utf-8")
+                f"{self.config.text_model_name}|{self.config.max_seq_len}|{self.segmenter_mode}"
+                f"|{self.config.text_truncation}".encode("utf-8")
             )
             for t in texts:
                 digest.update(t.encode("utf-8"))
@@ -446,39 +521,94 @@ class VMTFDataset(Dataset):
         segmented = [self.word_segmenter(t) for t in texts]
         input_ids: List[List[int]] = []
         chunk = 512
+        max_len = self.config.max_seq_len
+        head_tail = self.config.text_truncation == "head_tail"
+        n_long = 0
         for start in range(0, len(segmented), chunk):
-            enc = self.tokenizer(
-                segmented[start:start + chunk],
-                max_length=self.config.max_seq_len,
-                truncation=True,
-                padding=False,
-            )
-            input_ids.extend(enc["input_ids"])
+            batch_texts = segmented[start:start + chunk]
+            if head_tail:
+                # Tokenize in full, then keep the beginning and the end of long posts
+                full = self.tokenizer(batch_texts, truncation=False, padding=False)["input_ids"]
+                n_long += sum(len(ids) > max_len for ids in full)
+                input_ids.extend(head_tail_truncate(list(ids), max_len) for ids in full)
+            else:
+                enc = self.tokenizer(batch_texts, max_length=max_len, truncation=True, padding=False)
+                input_ids.extend(enc["input_ids"])
+        if head_tail:
+            logger.info(f"head_tail truncation applied to {n_long}/{len(texts)} texts longer than {max_len} tokens.")
 
         if cache_path is not None:
             torch.save(input_ids, cache_path)
             logger.info(f"Saved pre-tokenized text cache: {cache_path}")
         return input_ids
 
-    def _find_image_path(self, row: pd.Series) -> Optional[str]:
+    @staticmethod
+    def _find_image_paths(
+        values: Tuple[Any, ...], by_rel: Dict[str, str], by_name: Dict[str, str], limit: int = 1
+    ) -> List[str]:
         """
-        Return the first existing image path from primary and fallback columns, or None.
-        Supports full path, path relative to config.image_dir, and bare filename.
+        Up to `limit` existing, distinct images among the image columns of one row, in column order.
+        Accepts a path relative to image_dir, a bare file name, or a full / cwd-relative path.
         """
-        candidate_cols = ([self.image_col] if self.image_col else []) + self.alt_image_cols
-        for col in candidate_cols:
-            val = row.get(col, None)
+        found: List[str] = []
+        for val in values:
             if val is None or pd.isna(val) or str(val).strip() == "":
                 continue
             c_path = str(val).strip()
-            for p in (
-                c_path,
-                os.path.join(self.config.image_dir, c_path),
-                os.path.join(self.config.image_dir, os.path.basename(c_path)),
-            ):
-                if os.path.isfile(p):
-                    return p
-        return None
+            hit: Optional[str] = None
+            if os.path.isabs(c_path) and os.path.isfile(c_path):
+                hit = c_path  # an explicit full path wins over a same-named file in image_dir
+            else:
+                rel = os.path.normpath(c_path).replace(os.sep, "/")
+                hit = by_rel.get(rel) or by_name.get(os.path.basename(rel))
+                if hit is None and os.path.isfile(c_path):
+                    hit = c_path
+            if hit is not None and hit not in found:
+                found.append(hit)
+                if len(found) >= limit:
+                    break
+        return found
+
+    def _preload_images(self) -> None:
+        """Decode + squash every image once into a uint8 array (config.cache_images)."""
+        entries = [(i, j) for i, paths in enumerate(self.image_lists) for j in range(len(paths))]
+        size = self.config.image_size
+        logger.info(
+            f"Caching {len(entries)} images in RAM at {size}x{size} "
+            f"(~{len(entries) * size * size * 3 / 1024 ** 3:.2f} GB)..."
+        )
+        cache = np.zeros((len(entries), size, size, 3), dtype=np.uint8)
+
+        def _load(k: int) -> bool:
+            i, j = entries[k]
+            image, ok = self._load_image(self.image_lists[i][j])
+            if ok:
+                cache[k] = np.asarray(self.resize(image))
+            return ok
+
+        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+            oks = list(pool.map(_load, range(len(entries))))
+
+        # Corrupted files are dropped here, so they count as missing from the start
+        cache_row = np.full((len(self.df), self.max_images), -1, dtype=np.int64)
+        kept: List[List[str]] = [[] for _ in range(len(self.df))]
+        for k, ((i, j), ok) in enumerate(zip(entries, oks)):
+            if ok:
+                cache_row[i, len(kept[i])] = k
+                kept[i].append(self.image_lists[i][j])
+        self.image_lists = kept
+        self.image_cache, self._cache_row = cache, cache_row
+
+    def _load_slot(self, idx: int, slot: int) -> Optional[torch.Tensor]:
+        """Preprocessed tensor of image `slot` of sample `idx`, or None (missing / unreadable)."""
+        if self.image_cache is not None:
+            k = int(self._cache_row[idx, slot])
+            image = Image.fromarray(self.image_cache[k]) if k >= 0 else None
+        else:
+            paths = self.image_lists[idx]
+            image, ok = self._load_image(paths[slot]) if slot < len(paths) else (None, False)
+            image = self.resize(image) if ok else None
+        return self.post_transform(image) if image is not None else None
 
     def _load_image(self, path: Optional[str]) -> Tuple[Optional[Image.Image], bool]:
         """Load an RGB image. Returns (image, ok); ok=False when missing or corrupted."""
@@ -500,7 +630,9 @@ class VMTFDataset(Dataset):
                 - 'id': str
                 - 'input_ids': torch.LongTensor [seq_len] (unpadded; padded in collate)
                 - 'pixel_values': torch.FloatTensor [3, image_size, image_size]
-                - 'has_image': torch.FloatTensor scalar (1 = real image, 0 = missing)
+                  (max_images > 1: [max_images, 3, image_size, image_size])
+                - 'has_image': torch.FloatTensor scalar (1 = at least one real image, 0 = none)
+                - 'image_slot_mask': torch.FloatTensor [max_images] (only when max_images > 1)
                 - 'social_features': torch.FloatTensor [num_social_features]
                 - 'label': torch.LongTensor scalar (if labels available)
         """
@@ -516,14 +648,21 @@ class VMTFDataset(Dataset):
             item["style_features"] = torch.from_numpy(self.normalized_style[idx])
 
         if self.config.uses_image:
-            image, ok = self._load_image(self.image_paths[idx])
-            if ok:
-                item["pixel_values"] = self.image_transform(image)
+            size = self.config.image_size
+            # Missing slots stay zero tensors; the model never encodes them (slot mask = 0)
+            pixels = torch.zeros(self.max_images, 3, size, size)
+            slot_mask = torch.zeros(self.max_images)
+            for slot in range(self.max_images):
+                tensor = self._load_slot(idx, slot)
+                if tensor is not None:
+                    pixels[slot] = tensor
+                    slot_mask[slot] = 1.0
+            item["has_image"] = slot_mask.max()
+            if self.max_images == 1:
+                item["pixel_values"] = pixels[0]
             else:
-                # Zero tensor; the model ignores it through has_image = 0
-                size = self.config.image_size
-                item["pixel_values"] = torch.zeros(3, size, size)
-            item["has_image"] = torch.tensor(1.0 if ok else 0.0)
+                item["pixel_values"] = pixels
+                item["image_slot_mask"] = slot_mask
 
         if self.labels is not None:
             item["label"] = torch.tensor(int(self.labels[idx]), dtype=torch.long)
@@ -574,6 +713,8 @@ class VMTFCollate:
         if "pixel_values" in batch[0]:
             collated["pixel_values"] = torch.stack([item["pixel_values"] for item in batch], dim=0)
             collated["has_image"] = torch.stack([item["has_image"] for item in batch], dim=0)
+            if "image_slot_mask" in batch[0]:
+                collated["image_slot_mask"] = torch.stack([item["image_slot_mask"] for item in batch], dim=0)
 
         if all("label" in item for item in batch):
             collated["label"] = torch.stack([item["label"] for item in batch], dim=0)

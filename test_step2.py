@@ -84,6 +84,20 @@ def run_tests() -> None:
 
     _, _, contra_compat = CrossModalContradictionAttention(cfg)(text_tokens, patch_tokens, mask, image_mask)
     assert contra_compat.shape == (B, 384)
+    # Several images per post: patches of empty slots must not influence anything
+    K = 2
+    multi_patches = torch.randn(B, K * P, D)
+    patch_mask = torch.ones(B, K * P)
+    patch_mask[0, P:] = 0          # post 0: only its first image exists
+    patch_mask[2, :] = 0           # post 2: no image at all (would give NaN without the guard)
+    t_m, i_m = attn(text_tokens, multi_patches, mask, None, patch_mask)
+    assert torch.isfinite(t_m).all() and torch.isfinite(i_m).all(), "NaN with fully masked patches"
+    assert torch.all(i_m[2] == 0), "post without image must have a zero image summary"
+    noisy = multi_patches.clone()
+    noisy[0, P:] = torch.randn(P, D)          # change only the masked (empty-slot) patches
+    t_n, i_n = attn(text_tokens, noisy, mask, None, patch_mask)
+    assert torch.allclose(t_m[0], t_n[0], atol=1e-5), "empty image slot leaked into the text summary"
+    assert torch.allclose(i_m[0], i_n[0], atol=1e-5), "empty image slot leaked into the image summary"
     print("    [OK] Stage 1 shapes and missing-image masking passed.")
 
     # 3. Gated fusion

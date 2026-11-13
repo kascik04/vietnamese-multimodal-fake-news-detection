@@ -73,7 +73,9 @@ EXTENDED_SOCIAL_COLS: List[str] = [
 FUSION_TYPES: List[str] = ["hybrid_proposed", "late_concat", "text_only", "image_only", "social_only"]
 
 # Hardware-dependent fields: never restored from a checkpoint trained on another machine.
-RUNTIME_FIELDS: List[str] = ["device", "use_amp", "amp_dtype", "allow_tf32", "num_workers", "pin_memory", "multi_gpu"]
+RUNTIME_FIELDS: List[str] = [
+    "device", "use_amp", "amp_dtype", "allow_tf32", "num_workers", "pin_memory", "multi_gpu", "cache_images",
+]
 
 
 @dataclass
@@ -97,6 +99,14 @@ class VMTFConfig:
 
     freeze_text_layers: int = 0
     """Number of bottom transformer layers to freeze (0 to fine-tune all)"""
+
+    text_truncation: str = "head"
+    """How texts longer than max_seq_len are cut: 'head' (keep the beginning) or 'head_tail'
+    (keep the first quarter and the end of the post: conclusions / calls to share are often last)."""
+
+    use_ocr_text: bool = False
+    """Append the text read inside the images (column `ocr_text`, written by scripts/ocr_images.py)
+    to the post text. Screenshot-style fake news carries its claim in the image, not in the caption."""
 
     text_pooling: str = "cls"
     """Sentence pooling: 'cls' (hidden state of <s>) or 'mean' (masked mean over tokens).
@@ -123,6 +133,11 @@ class VMTFConfig:
 
     freeze_visual_layers: int = 0
     """Number of bottom visual transformer layers to freeze (0 to fine-tune all)"""
+
+    max_images: int = 1
+    """Images used per post (1-3, columns image_1..3_local_path). 1 = first available image.
+    With > 1, every existing image is encoded (ViT cost grows with the number of images) and the
+    patches of all images are attended jointly; the visual embedding is the mean over the images."""
 
     # ==========================================
     # 3. SOCIAL METRICS ENCODER (MLP)
@@ -209,6 +224,11 @@ class VMTFConfig:
 
     consistency_margin: float = 0.2
     """Cosine margin for fake samples in the consistency loss"""
+
+    gate_entropy_lambda: float = 0.0
+    """Weight of the gate entropy bonus (hybrid only): loss -= lambda * H(beta), averaged over posts
+    with an image. 0 = off. A small value (0.01-0.05) keeps the gate from saturating at alpha = 1 or
+    beta = 1 early in training; check `gate_saturation` in results.json before enabling it."""
 
     use_focal_loss: bool = False
     """Whether to use Focal Loss instead of CrossEntropy for imbalanced datasets"""
@@ -301,6 +321,10 @@ class VMTFConfig:
     image_dir: str = "data/images"
     """Root directory containing social media images"""
 
+    cache_images: bool = False
+    """Decode + resize every image once into RAM (uint8, ~150KB per image at 224px) instead of
+    re-decoding JPEGs every epoch. Same pixels as the normal pipeline; big speed-up on 2-4 vCPU machines."""
+
     cache_dir: Optional[str] = None
     """Optional directory to cache pre-tokenized text (e.g. /kaggle/working/cache)"""
 
@@ -320,6 +344,11 @@ class VMTFConfig:
 
         if self.fusion_type not in FUSION_TYPES:
             raise ValueError(f"Unknown fusion_type '{self.fusion_type}'. Choose one of {FUSION_TYPES}.")
+        self.max_images = int(self.max_images)
+        if not 1 <= self.max_images <= 3:
+            raise ValueError("max_images must be 1, 2 or 3 (the schema has image_1..3_local_path).")
+        if self.text_truncation not in ("head", "head_tail"):
+            raise ValueError("text_truncation must be 'head' or 'head_tail'.")
         if self.text_pooling not in ("cls", "mean"):
             raise ValueError("text_pooling must be 'cls' or 'mean'.")
         if self.word_segmenter not in ("auto", "vncorenlp", "pyvi", "none"):
@@ -386,8 +415,14 @@ class VMTFConfig:
             parts.append(_short_model_name(self.text_model_name))
             if self.text_pooling != "cls":
                 parts.append(f"pool-{self.text_pooling}")
+            if self.text_truncation != "head":
+                parts.append(f"trunc-{self.text_truncation}")
+            if self.use_ocr_text:
+                parts.append("ocr")
         if self.uses_image:
             parts.append(_short_model_name(self.visual_model_name))
+            if self.max_images > 1:
+                parts.append(f"img{self.max_images}")
         if self.uses_social:
             parts.append(f"social-{self.social_preset}")
         if self.uses_style:
@@ -398,6 +433,8 @@ class VMTFConfig:
             parts.append(f"cw-{self.class_weighting}")
         if self.uses_text and self.uses_image:
             parts.append(f"lambda{self.consistency_lambda}")
+        if self.fusion_type == "hybrid_proposed" and self.use_gate and self.gate_entropy_lambda > 0:
+            parts.append(f"gateH{self.gate_entropy_lambda}")
         parts.append(f"seed{self.seed}")
         return "_".join(parts)
 

@@ -44,6 +44,7 @@ vmtf_net/
 ├── losses.py             # Focal Loss, masked Text-Image Consistency Loss, Combined Loss
 ├── style_features.py     # Clickbait / sensational-style features + explanations (no torch)
 ├── retrieval/            # Evidence layer: claim KB search, source credibility, PostChecker
+├── predict.py            # Single-post scoring API / CLI (same preprocessing as training)
 ├── train.py              # AMP, grad accumulation, DataParallel, resume, history, final test
 └── evaluate.py           # Metrics + bootstrap CIs, threshold tuning, interpretability, predictions CSV
 
@@ -52,6 +53,8 @@ scripts/
 ├── run_seeds.py                        # Multi-seed / K-fold runner + mean ± std aggregation
 ├── significance_test.py                # McNemar + paired bootstrap between two models
 ├── convert_reintel.py                  # ReINTEL (VLSP 2020) -> 55-column schema
+├── ocr_images.py                       # Offline OCR of post images -> `ocr_text` column (easyocr)
+├── package_dataset.py                  # train/val/test + images -> one portable zip
 ├── resize_images.py                    # One-off image downscaling (faster data loading)
 ├── build_claim_kb.py                   # Index the fact-checked claim knowledge base
 └── check_post.py                       # Check one post / evaluate the evidence layer
@@ -88,6 +91,12 @@ python scripts/validate_and_preprocess_dataset.py --input_csv data/raw.csv --kfo
 ```
 
 The script prints a leakage report and warns about empty / single-class splits.
+
+Package the splits + referenced images into one portable zip (same layout as `vmtf_sample_dataset.zip`, and the `data.zip` used by the Colab notebook):
+
+```bash
+python scripts/package_dataset.py --split_dir data --image_dir <images dir> --output vmtf_dataset.zip --include_folds
+```
 
 ---
 
@@ -131,10 +140,27 @@ experiments never share a folder. Training refuses to write into a folder that a
 * **Session limits (Kaggle 12 h, Colab disconnects):** re-run with `--resume <dir>/last_checkpoint.pt`.
 * **T4 x2:** both GPUs are used automatically (DataParallel; disable with `--no_multi_gpu`).
 * **A100 (Colab):** `--amp_dtype auto` (default) uses **bf16 + TF32** on Ampere GPUs and fp16 on T4/P100/V100; DataLoader workers are scaled to the vCPU count. Copy data from Drive to `/content` before training.
+* **Slow epochs / GPU waiting for data:** `--cache_images` decodes and resizes every image once into RAM (~150 KB per image at 224 px, identical pixels) instead of re-decoding JPEGs every epoch.
+* **Long posts:** `--text_truncation head_tail` keeps the beginning and the end of posts longer than `--max_seq_len` (default `head` keeps only the beginning); report it as an ablation.
 * **Out of memory:** `--gradient_checkpointing`, or `--batch_size 8 --grad_accum_steps 2` (same effective batch).
 * **Internet off:** add PhoBERT / ViT as a Kaggle Model or Dataset and pass local paths: `--text_model_name /kaggle/input/phobert-base --visual_model_name /kaggle/input/vit-base-patch16-224`.
 * **Best PhoBERT segmentation:** `pip install py_vncorenlp` (Java required) and add `--vncorenlp_dir /kaggle/working/vncorenlp` (models are downloaded automatically). Without it, pyvi is used.
 * **Clean logs for "Save & Run All":** `--no_tqdm`.
+
+### Score a single post (demo / extension backend)
+
+```python
+from vmtf_net.predict import VMTFPredictor
+predictor = VMTFPredictor.from_checkpoint("checkpoints/<exp>/best_vmtf_model.pt")
+predictor.predict("KHẨN CẤP!!! Chia sẻ gấp ...", images=["post.jpg"], like_count=1200, share_count=95)
+# {'prob_fake': 0.87, 'label': 1, 'threshold': 0.42, 'alpha_text': 0.69, 'beta_image': 0.31, 'style_signals': [...]}
+```
+
+```bash
+python -m vmtf_net.predict --checkpoint <ckpt> --text "..." --image post.jpg --kb_dir data/kb/index
+```
+
+Posts go through the same `VMTFDataset` and checkpoint normalizers as training, so scores match the evaluation numbers. `--kb_dir` adds the evidence layer (section 6). For freshly published posts (no engagement yet) serve a checkpoint trained with `--no_social`.
 
 ### Evaluate a checkpoint separately
 
@@ -166,6 +192,9 @@ The decision threshold is taken from `--threshold`, else tuned on `--val_csv`, e
 | Image only (ViT) | `--fusion_type image_only` |
 | Social only (MLP) | `--fusion_type social_only` |
 | ViSoBERT backbone | `--text_model_name uitnlp/visobert` (segmentation is disabled automatically) |
+| Up to 3 images per post | `--max_images 3` (only real images are encoded; ViT cost grows with the number of images) |
+| + text inside images (OCR) | `python scripts/ocr_images.py --csv data/train.csv data/val.csv data/test.csv --image_dir <images>` then `--use_ocr_text` |
+| + gate entropy bonus | `--gate_entropy_lambda 0.02` (only if `gate_saturation.collapsed` is true in `results.json`) |
 | + style / clickbait branch | `--use_style` (on top of any of the above that uses text) |
 | Text + style (cheap strong baseline) | `--fusion_type text_only --use_style` |
 
@@ -194,6 +223,8 @@ Reports McNemar's exact test and a paired bootstrap CI / p-value for ΔMacro-F1 
 
 ### 5.4 Reporting checklist
 - Dataset statistics per split (size, fake ratio, % posts with image) and the split protocol (`group` / `source` / `time`).
+- Gate health: `interpretability.gate_saturation` in `results.json` (share of posts with β < 0.05 / β > 0.95). If the gate is collapsed, do not present α/β as modality reliability; compare with `--no_gate`.
+- Calibration: **ECE / Brier** in `results.json` (does "80%" mean 80%? required if probabilities are shown to users).
 - Main metrics: **Macro-F1, Fake-class F1, AUC-ROC, PR-AUC** (accuracy alone is misleading on imbalanced data), with CIs or mean ± std.
 - Ablation table (5.1) and significance tests against the strongest baseline.
 - Interpretability from `results.json`: distribution of β per class, text-image cosine real vs. fake, metrics with vs. without image.
